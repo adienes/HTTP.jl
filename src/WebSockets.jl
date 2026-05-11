@@ -506,7 +506,7 @@ WebSockets.open(url) do ws
 end
 ```
 """
-function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, kw...)
+function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, kw...)
     key = base64encode(rand(Random.RandomDevice(), UInt8, 16))
     headers = [
         "Upgrade" => "websocket",
@@ -528,6 +528,18 @@ function open(f::Function, url; suppress_close_error::Bool=false, verbose=false,
         # doing websocket things
         http.ntoread = 0
         io = http.stream
+        # Match server-side WebSockets.upgrade: disable Nagle and request
+        # immediate ACKs, since websocket framing is application-level and
+        # waiting up to 40 ms for TCP coalescing crushes interactive
+        # round-trip latency. Latency-sensitive clients (HFT) lived with
+        # this on the server but not on the client until now.
+        # See https://github.com/JuliaWeb/HTTP.jl/issues/1140.
+        let sock = tcpsocket(io)
+            if sock.status ∉ (Base.StatusInit, Base.StatusUninit) && isopen(sock)
+                try Sockets.nagle(sock, nagle) catch end
+                try Sockets.quickack(sock, quickack) catch end
+            end
+        end
         ws = WebSocket(io, http.message.request, http.message; maxframesize, maxfragmentation)
         @debug "$(ws.id): WebSocket opened"
         try
