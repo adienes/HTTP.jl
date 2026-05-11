@@ -1,6 +1,7 @@
 module WebSockets
 
 using Base64, UUIDs, Sockets, Random
+using Random: Xoshiro
 using MbedTLS: digest, MD_SHA1, SSLContext
 using ..IOExtras, ..Streams, ..Connections, ..Messages, ..Conditions, ..Servers
 using ..Exceptions: current_exceptions_to_string
@@ -232,6 +233,99 @@ function writeframe(io::IO, x::Frame)
     return n
 end
 
+# Maximum websocket header length: 2 flags + 8 ext-len + 4 mask = 14 bytes.
+const WS_MAX_HEADER = 14
+
+# Header length for a frame with `payloadlen` bytes and `masked`.
+@inline function header_len_for(payloadlen::Integer, masked::Bool)
+    base = payloadlen < 0x7E ? 2 :
+           payloadlen <= 0xFFFF ? 4 : 10
+    return base + (masked ? 4 : 0)
+end
+
+# Build the websocket frame header into `buf[1 : header_len_for(...)]`.
+# Caller (write_frame!) guarantees the buffer is large enough.
+# Layout follows RFC 6455 §5.2.
+@inline function write_header!(buf::Vector{UInt8}, final::Bool, opcode::OpCode,
+                               masked::Bool, payloadlen::Integer, mask_u32::UInt32,
+                               rsv1::Bool=false, rsv2::Bool=false, rsv3::Bool=false)
+    b1 = (final ? 0x80 : 0x00) |
+         (rsv1 ? 0x40 : 0x00) | (rsv2 ? 0x20 : 0x00) | (rsv3 ? 0x10 : 0x00) |
+         (UInt8(opcode) & 0x0F)
+    if payloadlen < 126
+        len7 = UInt8(payloadlen); extb = 0
+    elseif payloadlen <= 0xFFFF
+        len7 = 0x7E; extb = 2
+    else
+        len7 = 0x7F; extb = 8
+    end
+    b2 = (masked ? 0x80 : 0x00) | len7
+    @inbounds buf[1] = b1
+    @inbounds buf[2] = b2
+    pos = 3
+    GC.@preserve buf begin
+        if extb == 2
+            unsafe_store!(Ptr{UInt16}(pointer(buf, pos)), hton(UInt16(payloadlen)))
+            pos += 2
+        elseif extb == 8
+            unsafe_store!(Ptr{UInt64}(pointer(buf, pos)), hton(UInt64(payloadlen)))
+            pos += 8
+        end
+        if masked
+            # Stored in host byte order to match the existing wire convention
+            # used by readframe (`Mask(read(io, UInt32))`); on little-endian
+            # this places the low byte of `mask_u32` first on the wire, which
+            # matches mask!'s key[i] = (mask_u32 >> 8*(i mod 4)) & 0xFF.
+            unsafe_store!(Ptr{UInt32}(pointer(buf, pos)), mask_u32)
+            pos += 4
+        end
+    end
+    return pos - 1
+end
+
+# Generate a 32-bit masking key from the WebSocket's per-connection RNG.
+# RFC 6455 §5.3 only requires the key to be unpredictable per frame; we do
+# not need crypto-grade randomness, and over TLS the mask is cosmetic.
+# Type annotation deferred to call site so this can be defined before
+# the WebSocket struct without forward-declaration gymnastics.
+@inline ws_mask(ws) = rand(ws.rng, UInt32)
+
+# Low-level: emit one fully-prepared frame from `ws.writebuffer[1:total_len]`
+# in a single `unsafe_write`. Caller must hold `ws.writelock`.
+@inline function emit_frame!(ws, total_len::Int)
+    buf = ws.writebuffer
+    n = GC.@preserve buf unsafe_write(ws.io, pointer(buf), UInt(total_len))
+    return Int(n)
+end
+
+# Encode one frame and write it out via the WebSocket's preallocated buffer.
+# Replaces the per-frame `IOBuffer + take!` pattern in `writeframe`: builds
+# the header in place, copies/masks the payload after it, emits a single
+# `unsafe_write`. The buffer grows monotonically to its high-water mark, so
+# steady-state HFT use is alloc-free.
+function write_frame!(ws, final::Bool, opcode::OpCode, payload_data::AbstractVector{UInt8})
+    payloadlen = length(payload_data)
+    masked = ws.client
+    hlen = header_len_for(payloadlen, masked)
+    total = hlen + payloadlen
+    if length(ws.writebuffer) < total
+        resize!(ws.writebuffer, total)
+    end
+    mask_u32 = masked ? ws_mask(ws) : UInt32(0)
+    write_header!(ws.writebuffer, final, opcode, masked, payloadlen, mask_u32)
+    if payloadlen > 0
+        copyto!(ws.writebuffer, hlen + 1, payload_data, firstindex(payload_data), payloadlen)
+        if masked
+            mask!(ws.writebuffer, mask_u32, hlen + 1, payloadlen)
+        end
+    end
+    return emit_frame!(ws, total)
+end
+
+# Empty-payload convenience used by control frames.
+write_frame!(ws, final::Bool, opcode::OpCode, ::Nothing) =
+    write_frame!(ws, final, opcode, UInt8[])
+
 "Status codes according to RFC 6455 7.4.1"
 const STATUS_CODE_DESCRIPTION = Dict{Int, String}(
     1000=>"Normal",                     1001=>"Going Away",
@@ -325,14 +419,30 @@ mutable struct WebSocket
     writebuffer::Vector{UInt8}
     readclosed::Bool
     writeclosed::Bool
+    # Per-WS PRNG for masking-key generation. Seeded once from RandomDevice
+    # to avoid a /dev/urandom syscall per outgoing client frame.
+    rng::Xoshiro
+    # Serializes the write path so multiple producer tasks sharing a
+    # WebSocket can call send/ping/pong concurrently without corrupting
+    # `writebuffer`. Cheap (uncontended) in the single-writer case.
+    writelock::ReentrantLock
 end
 
 const DEFAULT_MAX_FRAG = 1024
 
 IOExtras.tcpsocket(ws::WebSocket) = tcpsocket(ws.io)
 
-WebSocket(io::Connection, req=Request(), resp=Response(); client::Bool=true, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG) =
-    WebSocket(uuid4(), io, req, resp, maxframesize, maxfragmentation, client, UInt8[], UInt8[], false, false)
+function WebSocket(io::Connection, req=Request(), resp=Response();
+                   client::Bool=true,
+                   maxframesize::Integer=typemax(Int),
+                   maxfragmentation::Integer=DEFAULT_MAX_FRAG)
+    rng = Xoshiro(rand(Random.RandomDevice(), UInt64),
+                  rand(Random.RandomDevice(), UInt64),
+                  rand(Random.RandomDevice(), UInt64),
+                  rand(Random.RandomDevice(), UInt64))
+    return WebSocket(uuid4(), io, req, resp, maxframesize, maxfragmentation, client,
+                     UInt8[], UInt8[], false, false, rng, ReentrantLock())
+end
 
 """
     WebSockets.isclosed(ws) -> Bool
@@ -528,6 +638,13 @@ function payload(ws, x)
     end
 end
 
+# Coerce a `send` argument to an `AbstractVector{UInt8}` for `write_frame!`.
+# `codeunits(::String)` returns a zero-copy `CodeUnits{UInt8, String}` view
+# that satisfies `AbstractVector{UInt8}` and supports `copyto!`.
+@inline _frame_payload(x::AbstractVector{UInt8}) = x
+@inline _frame_payload(x::AbstractString) = codeunits(x)
+@inline _frame_payload(x) = codeunits(string(x))
+
 """
     send(ws::WebSocket, msg)
 
@@ -544,33 +661,32 @@ the close sequence and close the underlying connection.
 function Sockets.send(ws::WebSocket, x)
     @debug "$(ws.id): Writing non-control message"
     @require !ws.writeclosed
-    if !isbinary(x) && !istext(x)
-        # if x is not single binary or text, then assume it's an iterable of binary or text
-        # and we'll send fragmented message
-        first = true
-        n = 0
+    lock(ws.writelock)
+    try
+        if isbinary(x) || istext(x)
+            return write_frame!(ws, true, opcode(x), _frame_payload(x))
+        end
+        # Fragmented send: x is an iterable of binary or text fragments.
         state = iterate(x)
         if state === nothing
-            # x was not binary or text, but is an empty iterable, send single empty frame
-            x = ""
-            @goto write_single_frame
+            return write_frame!(ws, true, TEXT, UInt8[])
         end
         @debug "$(ws.id): Writing fragmented message"
         item, st = state
-        # we prefetch next state so we know if we're on the last item or not
-        # so we can appropriately set the FIN bit for the last fragmented frame
         nextstate = iterate(x, st)
+        first = true
+        n = 0
         while true
-            n += writeframe(ws.io, Frame(nextstate === nothing, first ? opcode(item) : CONTINUATION, ws.client, payload(ws, item)))
+            op = first ? opcode(item) : CONTINUATION
+            n += write_frame!(ws, nextstate === nothing, op, _frame_payload(item))
             first = false
             nextstate === nothing && break
             item, st = nextstate
             nextstate = iterate(x, st)
         end
-    else
-        # single binary or text frame for message
-@label write_single_frame
-        return writeframe(ws.io, Frame(true, opcode(x), ws.client, payload(ws, x)))
+        return n
+    finally
+        unlock(ws.writelock)
     end
 end
 
@@ -585,7 +701,12 @@ to when a PING message is received by a websocket connection.
 function ping(ws::WebSocket, data=UInt8[])
     @require !ws.writeclosed
     @debug "$(ws.id): sending ping"
-    return writeframe(ws.io, Frame(true, PING, ws.client, payload(ws, data)))
+    lock(ws.writelock)
+    try
+        return write_frame!(ws, true, PING, _frame_payload(data))
+    finally
+        unlock(ws.writelock)
+    end
 end
 
 """
@@ -600,7 +721,12 @@ used as a one-way heartbeat.
 function pong(ws::WebSocket, data=UInt8[])
     @require !ws.writeclosed
     @debug "$(ws.id): sending pong"
-    return writeframe(ws.io, Frame(true, PONG, ws.client, payload(ws, data)))
+    lock(ws.writelock)
+    try
+        return write_frame!(ws, true, PONG, _frame_payload(data))
+    finally
+        unlock(ws.writelock)
+    end
 end
 
 """
@@ -617,10 +743,23 @@ function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, "")
     isclosed(ws) && return
     @debug "$(ws.id): Closing websocket"
     ws.writeclosed = true
-    data = Vector{UInt8}(body.message)
-    prepend!(data, reinterpret(UInt8, [hton(UInt16(body.status))]))
+    msg = body.message
+    payload_len = 2 + sizeof(msg)
+    data = Vector{UInt8}(undef, payload_len)
+    st = hton(UInt16(body.status))
+    GC.@preserve data unsafe_store!(Ptr{UInt16}(pointer(data, 1)), st)
+    if sizeof(msg) > 0
+        GC.@preserve data msg unsafe_copyto!(pointer(data, 3),
+                                             convert(Ptr{UInt8}, pointer(msg)),
+                                             sizeof(msg))
+    end
     try
-        writeframe(ws.io, Frame(true, CLOSE, ws.client, data))
+        lock(ws.writelock)
+        try
+            write_frame!(ws, true, CLOSE, data)
+        finally
+            unlock(ws.writelock)
+        end
     catch
         # ignore thrown errors here because we're closing anyway
     end
