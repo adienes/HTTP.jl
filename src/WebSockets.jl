@@ -214,17 +214,6 @@ end
 write_frame!(ws, final::Bool, opcode::OpCode, ::Nothing) =
     write_frame!(ws, final, opcode, UInt8[])
 
-"Status codes according to RFC 6455 7.4.1"
-const STATUS_CODE_DESCRIPTION = Dict{Int, String}(
-    1000=>"Normal",                     1001=>"Going Away",
-    1002=>"Protocol Error",             1003=>"Unsupported Data",
-    1004=>"Reserved",                   1005=>"No Status Recvd- reserved",
-    1006=>"Abnormal Closure- reserved", 1007=>"Invalid frame payload data",
-    1008=>"Policy Violation",           1009=>"Message too big",
-    1010=>"Missing Extension",          1011=>"Internal Error",
-    1012=>"Service Restart",            1013=>"Try Again Later",
-    1014=>"Bad Gateway",                1015=>"TLS Handshake")
-
 @noinline validclosecheck(x) = (1000 <= x < 5000 && !(x in (1004, 1005, 1006, 1016, 1100, 2000, 2999))) || throw(WebSocketError(CloseFrameBody(1002, "Invalid close status code")))
 
 """
@@ -505,18 +494,28 @@ function hashedkey(key)
     return base64encode(digest(MD_SHA1, hashkey))
 end
 
-# Returns true if `msg`'s Sec-WebSocket-Extensions header indicates the
-# server accepted permessage-deflate (with any parameters). We don't
-# validate the specific parameters since we implement no_context_takeover
-# for both directions regardless of negotiation outcome — sub-optimal but
-# always wire-compatible.
-function _server_accepted_pmd(msg)
-    h = header(msg, "Sec-WebSocket-Extensions", "")
-    return occursin("permessage-deflate", lowercase(h))
-end
+# RFC 7692 permessage-deflate offer. Both sides advertise no-context-takeover,
+# which is the only mode the current implementation supports (each message is
+# compressed/decompressed in isolation; no sliding window shared across
+# messages).
+const PMD_HEADER_OFFER =
+    "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
 
-# Returns true if the client offered permessage-deflate.
-_client_offers_pmd(http) = _server_accepted_pmd(http.message)
+# True iff the `Sec-WebSocket-Extensions` header on a Request/Response
+# advertises permessage-deflate as one of its (comma-separated) extension
+# tokens. Substring search would over-match e.g. `x-permessage-deflate-foo`,
+# so we split on commas and check each token's first segment.
+function _pmd_in_extensions(msg)
+    h = header(msg, "Sec-WebSocket-Extensions", "")
+    isempty(h) && return false
+    for ext in eachsplit(h, ',')
+        # An extension is `token (";" param)*`; the leading token is the name.
+        name_end = something(findfirst(';', ext), lastindex(ext) + 1)
+        name = lowercase(strip(SubString(ext, firstindex(ext), prevind(ext, name_end))))
+        name == "permessage-deflate" && return true
+    end
+    return false
+end
 
 """
     WebSockets.open(handler, url; verbose=false, kw...)
@@ -585,11 +584,9 @@ function open(f::Function, url; suppress_close_error::Bool=false, verbose=false,
         headers...
     ]
     if permessage_deflate
-        # Offer the simplest interoperable form: bare permessage-deflate
-        # plus no_context_takeover on both sides. RFC 7692 servers are
-        # required to honor or refuse; if refused, we run uncompressed.
-        push!(headers, "Sec-WebSocket-Extensions" =>
-              "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+        # If the server refuses the extension, the response simply omits it
+        # and the connection runs uncompressed; we check below.
+        push!(headers, "Sec-WebSocket-Extensions" => PMD_HEADER_OFFER)
     end
     # HTTP.open
     open("GET", url, headers; verbose=verbose, kw...) do http
@@ -619,7 +616,7 @@ function open(f::Function, url; suppress_close_error::Bool=false, verbose=false,
         ws = WebSocket(io, http.message.request, http.message; maxframesize, maxfragmentation)
         # If the server accepted permessage-deflate, attach the compression
         # context. Otherwise leave `pmd === nothing` (no compression).
-        if permessage_deflate && _server_accepted_pmd(http.message)
+        if permessage_deflate && _pmd_in_extensions(http.message)
             ws.pmd = PMDContext()
         end
         @debug "$(ws.id): WebSocket opened (pmd=$(ws.pmd !== nothing))"
@@ -692,19 +689,18 @@ function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=f
     # If the client offered permessage-deflate (and the server allows it),
     # advertise acceptance with no_context_takeover on both sides — the
     # mode our implementation supports.
-    pmd_accepted = permessage_deflate && _client_offers_pmd(http)
+    pmd_accepted = permessage_deflate && _pmd_in_extensions(http.message)
     if pmd_accepted
-        setheader(http, "Sec-WebSocket-Extensions" =>
-                  "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+        setheader(http, "Sec-WebSocket-Extensions" => PMD_HEADER_OFFER)
     end
     startwrite(http)
     io = http.stream
     req = http.message
 
-    # tune websocket tcp connection for performance : https://github.com/JuliaWeb/HTTP.jl/issues/1140
-    @static if VERSION >= v"1.3"
-        sock = tcpsocket(io)
-        # I don't understand why uninitializd sockets can get here, but they can
+    # Tune the TCP connection for the websocket use case: disable Nagle,
+    # request immediate ACKs. See https://github.com/JuliaWeb/HTTP.jl/issues/1140.
+    # Sockets can occasionally arrive here uninitialized — skip them.
+    let sock = tcpsocket(io)
         if sock.status ∉ (Base.StatusInit, Base.StatusUninit) && isopen(sock)
             Sockets.nagle(sock, nagle)
             Sockets.quickack(sock, quickack)
