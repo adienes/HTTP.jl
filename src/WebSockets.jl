@@ -185,27 +185,30 @@ end
 end
 
 # Encode one frame and write it out via the WebSocket's preallocated buffer.
-# Replaces the per-frame `IOBuffer + take!` pattern in `writeframe`: builds
-# the header in place, copies/masks the payload after it, emits a single
-# `unsafe_write`. The buffer grows monotonically to its high-water mark, so
-# steady-state HFT use is alloc-free.
-function write_frame!(ws, final::Bool, opcode::OpCode, payload_data::AbstractVector{UInt8})
+# Replaces the per-frame `IOBuffer + take!` pattern in the legacy code:
+# builds the header in place, copies/masks the payload after it, emits a
+# single `unsafe_write`. The buffer grows monotonically to its high-water
+# mark, so steady-state HFT use is alloc-free.
+#
+# `rsv1=true` signals permessage-deflate compression to the peer.
+# `app_payload_bytes` is the *uncompressed* size for stats purposes; on the
+# uncompressed path it defaults to the wire size, on the compressed path
+# the caller passes the pre-deflate length so `bytes_sent` stays meaningful.
+function write_frame!(ws, final::Bool, opcode::OpCode, payload_data::AbstractVector{UInt8};
+                      rsv1::Bool=false, app_payload_bytes::Int=length(payload_data))
     payloadlen = length(payload_data)
     masked = ws.client
     total = header_len_for(payloadlen, masked) + payloadlen
     if length(ws.writebuffer) < total
         resize!(ws.writebuffer, total)
     end
-    _encode_frame!(ws, ws.writebuffer, 0, final, opcode, payload_data)
+    _encode_frame!(ws, ws.writebuffer, 0, final, opcode, payload_data; rsv1=rsv1)
     n = emit_frame!(ws, total)
-    # Frame-level metrics (includes control frames). `bytes_sent` counts only
-    # data frame payload bytes — that's what HFT operators usually want to
-    # graph; control frame chatter is tracked via ping_count separately.
     s = ws.stats
     s.frames_sent += 1
-    if opcode == TEXT || opcode == BINARY || opcode == CONTINUATION
-        s.bytes_sent += payloadlen
-        s.compressed_bytes_sent += payloadlen  # no compression in this path
+    if !iscontrol(opcode)
+        s.bytes_sent += app_payload_bytes
+        s.compressed_bytes_sent += payloadlen
     end
     return n
 end
@@ -752,30 +755,18 @@ opcode(x) = isbinary(x) ? BINARY : TEXT
 @inline _frame_payload(x::AbstractString) = codeunits(x)
 @inline _frame_payload(x) = codeunits(string(x))
 
-# Send one fully-compressed message in a single frame, with RSV1 set.
-# RFC 7692 §7.2.1: compress the message with Z_SYNC_FLUSH and strip the
-# trailing 0x00 0x00 0xff 0xff. The compressed bytes go in `ws.pmd.deflate_out`,
-# which is reused across sends.
+# Send one fully-compressed message in a single frame with RSV1=1.
+# RFC 7692 §7.2.1: deflate with Z_SYNC_FLUSH, strip the trailing
+# 0x00 0x00 0xff 0xff sync tail. We compress into `pmd.deflate_out` (a
+# reusable per-WS scratch) and then hand a view of the compressed bytes to
+# `write_frame!`, telling it the original uncompressed length so the stats
+# distinguish wire bytes from app bytes.
 function _send_compressed_frame!(ws::WebSocket, op::OpCode, payload::AbstractVector{UInt8})
     pmd = ws.pmd::PMDContext
     plen = length(payload)
     nbytes = PMD.compress_message!(pmd.deflate, payload, plen, pmd.deflate_out)
-    masked = ws.client
-    total = header_len_for(nbytes, masked) + nbytes
-    if length(ws.writebuffer) < total
-        resize!(ws.writebuffer, total)
-    end
-    # Read compressed bytes from pmd.deflate_out into the WebSocket writebuffer
-    # via _encode_frame!. Because `payload_data` is an AbstractVector{UInt8},
-    # we pass a view over pmd.deflate_out.
-    _encode_frame!(ws, ws.writebuffer, 0, true, op,
-                   view(pmd.deflate_out, 1:nbytes); rsv1=true)
-    n = emit_frame!(ws, total)
-    s = ws.stats
-    s.frames_sent += 1
-    s.bytes_sent += plen          # uncompressed payload (app-level metric)
-    s.compressed_bytes_sent += nbytes  # post-deflate wire bytes (ratio numerator)
-    return n
+    return write_frame!(ws, true, op, view(pmd.deflate_out, 1:nbytes);
+                        rsv1=true, app_payload_bytes=plen)
 end
 
 """
