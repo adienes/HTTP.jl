@@ -33,7 +33,7 @@ PrecompileTools = "1.2.1"
 SimpleBufferStream = "1.1"
 URIs = "1.6" # We need URIs >= 1.6 to ensure we have https://github.com/JuliaWeb/URIs.jl/pull/66
 Zlib_jll = "1"
-julia = "1.6"
+julia = "1.10"
 
 [extras]
 BufferedStreams = "e1450e63-4bb3-523b-b2a4-4ffa8c0fd77d"

@@ -303,13 +303,15 @@ on handshake when `permessage_deflate=true` is negotiated, finalised
 in `close(ws)`.
 """
 mutable struct PMDContext
-    deflate::PMD.ZStream
-    inflate::PMD.ZStream
+    # ZStream is itself mutable (libz writes through the Ref via ccall); we
+    # never reassign the field.
+    const deflate::PMD.ZStream
+    const inflate::PMD.ZStream
     # Output buffer for compressed payload (send path). Grown to high-water mark.
-    deflate_out::Vector{UInt8}
+    const deflate_out::Vector{UInt8}
     # Output buffer for decompressed payload (receive path).
-    inflate_out::Vector{UInt8}
-    # finalize() must be called exactly once.
+    const inflate_out::Vector{UInt8}
+    # Guards against double-finalize between explicit `_pmd_close!` and the GC finalizer.
     closed::Bool
 end
 function PMDContext()
@@ -380,23 +382,26 @@ end
 ```
 """
 mutable struct WebSocket
-    id::UUID
-    io::Connection
-    request::Request
-    response::Response
-    maxframesize::Int
-    maxfragmentation::Int
-    client::Bool
-    readbuffer::Vector{UInt8}
-    writebuffer::Vector{UInt8}
+    const id::UUID
+    const io::Connection
+    const request::Request
+    const response::Response
+    const maxframesize::Int
+    const maxfragmentation::Int
+    const client::Bool
+    # Buffers: the field never holds a different vector, but the vector's
+    # contents and length are mutated via resize!/copyto!/mask!. So the
+    # *field* is const; the *bytes* are not.
+    const readbuffer::Vector{UInt8}
+    const writebuffer::Vector{UInt8}
     # Pre-sized scratch for inline control frame payloads (PING/PONG/CLOSE).
     # RFC 6455 caps control payloads at 125 bytes; we keep this buffer at its
     # max size permanently so ping-heavy feeds never allocate on receive.
-    ctlbuffer::Vector{UInt8}
+    const ctlbuffer::Vector{UInt8}
     # Pre-sized scratch for the variable-length frame header. Largest header
     # is 14 bytes (2 flags + 8 ext-len + 4 mask). Used by the receive fast
     # path so we don't allocate a `Ref{T}` per call to read(io, T).
-    headerbuf::Vector{UInt8}
+    const headerbuf::Vector{UInt8}
     # message_len tracks the assembled payload length in readbuffer for the
     # receive paths (frame data is accumulated in readbuffer and message_len
     # marks the valid prefix).
@@ -405,25 +410,26 @@ mutable struct WebSocket
     writeclosed::Bool
     # Per-WS PRNG for masking-key generation. Seeded once from RandomDevice
     # to avoid a /dev/urandom syscall per outgoing client frame.
-    rng::Xoshiro
+    const rng::Xoshiro
     # Serializes the write path so multiple producer tasks sharing a
     # WebSocket can call send/ping/pong concurrently without corrupting
     # `writebuffer`. Cheap (uncontended) in the single-writer case.
-    writelock::ReentrantLock
+    const writelock::ReentrantLock
     # Background Timer that pings at `ping_interval` and closes the socket
     # if no PONG has arrived within `pong_timeout`. `nothing` when heartbeat
-    # is disabled. `close` cancels it.
+    # is disabled. `close` cancels it. Reassigned by `_start_heartbeat!` and
+    # `close`, so not const.
     heartbeat::Union{Timer,Nothing}
     # Operational metrics. See [`WebSocketStats`](@ref) / [`stats`](@ref).
-    stats::WebSocketStats
+    const stats::WebSocketStats
     # RFC 7692 permessage-deflate context; `nothing` when the extension was
-    # not negotiated. Created during handshake by `open` / `upgrade`.
+    # not negotiated. Reassigned by the handshake (set) and `close` (clear).
     pmd::Union{PMDContext,Nothing}
     # Auxiliary buffer used by the receive path when a compressed message is
     # spread across multiple frames. Compressed bytes accumulate here; once
     # the FIN frame arrives we inflate into `pmd.inflate_out` and copy back
     # into `readbuffer` so receive() sees a uniform layout.
-    compressed_buffer::Vector{UInt8}
+    const compressed_buffer::Vector{UInt8}
 end
 
 const DEFAULT_MAX_FRAG = 1024
@@ -577,7 +583,7 @@ function _start_heartbeat!(ws::WebSocket, interval::Union{Nothing,Real}, timeout
     return t
 end
 
-function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=false, kw...)
+function open(f::F, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=false, kw...) where {F}
     key = base64encode(rand(Random.RandomDevice(), UInt8, 16))
     headers = [
         "Upgrade" => "websocket",
@@ -672,10 +678,12 @@ end
 """
 function listen end
 
-listen(f, args...; kw...) = Servers.listen(http -> upgrade(f, http; kw...), args...; kw...)
-listen!(f, args...; kw...) = Servers.listen!(http -> upgrade(f, http; kw...), args...; kw...)
+listen(f::F, args...; kw...) where {F} =
+    Servers.listen(http -> upgrade(f, http; kw...), args...; kw...)
+listen!(f::F, args...; kw...) where {F} =
+    Servers.listen!(http -> upgrade(f, http; kw...), args...; kw...)
 
-function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=true, kw...)
+function upgrade(f::F, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=true, kw...) where {F}
     @debug "Server websocket upgrade requested"
     isupgrade(http.message) || handshakeerror()
     if !hasheader(http, "Sec-WebSocket-Version", "13")
@@ -1001,8 +1009,11 @@ end
 #
 # Reads bytes directly into `hbuf` via `unsafe_read` and parses fields with
 # `unsafe_load`. Avoids the per-call `Ref{T}` heap allocation that the generic
-# `Base.read(io, T)` path uses for primitive types.
-@inline function _read_header(io::IO, hbuf::Vector{UInt8})
+# `Base.read(io, T)` path uses for primitive types. Inlining is forced at the
+# `_recv_message!` call site (via `@inline _read_header(...)`) — that's what
+# matters for keeping the returned tuple unboxed; no need to mark the
+# definition.
+function _read_header(io::IO, hbuf::Vector{UInt8})
     iocheck(io)
     GC.@preserve hbuf begin
         p = pointer(hbuf)
@@ -1092,16 +1103,18 @@ function _recv_message!(ws::WebSocket)
                 if ctl_n == 1
                     throw(WebSocketError(CloseFrameBody(1002, "Close frame cannot have body of length 1")))
                 end
-                status = ctl_n >= 2 ? Int((UInt16(ctl[1]) << 8) | ctl[2]) : 1005
-                if ctl_n >= 2
-                    validclosecheck(status)
-                end
-                # CLOSE body string only allocates here when there's a reason text;
-                # not on the hot path (one CLOSE per connection lifetime).
-                close_msg = if ctl_n > 2
-                    GC.@preserve ctl unsafe_string(pointer(ctl) + 2, ctl_n - 2)
+                status = if ctl_n >= 2
+                    s = Int((UInt16(ctl[1]) << 8) | ctl[2])
+                    validclosecheck(s)
+                    s
                 else
-                    ""
+                    1005
+                end
+                # CLOSE body string only allocates when there's a reason text;
+                # not on the hot path (one CLOSE per connection lifetime).
+                close_msg = ""
+                if ctl_n > 2
+                    close_msg = GC.@preserve ctl unsafe_string(pointer(ctl) + 2, ctl_n - 2)
                 end
                 utf8check(close_msg)
                 body = CloseFrameBody(status, close_msg)
@@ -1195,7 +1208,7 @@ end
 # keep waiting on a half-open socket.
 #
 # `timeout::Nothing` means no deadline; `body()` is called directly.
-@inline function _with_recv_deadline(body, ws::WebSocket, timeout)
+@inline function _with_recv_deadline(body::F, ws::WebSocket, timeout) where {F}
     timeout === nothing && return body()
     timed_out = Ref(false)
     t = Timer(Float64(timeout)) do _
@@ -1298,8 +1311,8 @@ WebSockets.open(url) do ws
 end
 ```
 """
-function receive(f::Function, ws::WebSocket; validate_utf8::Bool=false,
-                 timeout::Union{Nothing,Real}=nothing)
+function receive(f::F, ws::WebSocket; validate_utf8::Bool=false,
+                 timeout::Union{Nothing,Real}=nothing) where {F<:Function}
     @debug "$(ws.id): Reading message (zero-copy)"
     return _with_recv_deadline(ws, timeout) do
         op = _recv_message!(ws)
