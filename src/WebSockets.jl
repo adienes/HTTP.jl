@@ -417,6 +417,18 @@ mutable struct WebSocket
     client::Bool
     readbuffer::Vector{UInt8}
     writebuffer::Vector{UInt8}
+    # Pre-sized scratch for inline control frame payloads (PING/PONG/CLOSE).
+    # RFC 6455 caps control payloads at 125 bytes; we keep this buffer at its
+    # max size permanently so ping-heavy feeds never allocate on receive.
+    ctlbuffer::Vector{UInt8}
+    # Pre-sized scratch for the variable-length frame header. Largest header
+    # is 14 bytes (2 flags + 8 ext-len + 4 mask). Used by the receive fast
+    # path so we don't allocate a `Ref{T}` per call to read(io, T).
+    headerbuf::Vector{UInt8}
+    # message_len tracks the assembled payload length in readbuffer for the
+    # receive paths (frame data is accumulated in readbuffer and message_len
+    # marks the valid prefix).
+    message_len::Int
     readclosed::Bool
     writeclosed::Bool
     # Per-WS PRNG for masking-key generation. Seeded once from RandomDevice
@@ -441,7 +453,10 @@ function WebSocket(io::Connection, req=Request(), resp=Response();
                   rand(Random.RandomDevice(), UInt64),
                   rand(Random.RandomDevice(), UInt64))
     return WebSocket(uuid4(), io, req, resp, maxframesize, maxfragmentation, client,
-                     UInt8[], UInt8[], false, false, rng, ReentrantLock())
+                     UInt8[], UInt8[],
+                     Vector{UInt8}(undef, 125),           # ctlbuffer
+                     Vector{UInt8}(undef, WS_MAX_HEADER), # headerbuf
+                     0, false, false, rng, ReentrantLock())
 end
 
 """
@@ -826,8 +841,152 @@ end
 _append(x::AbstractVector{UInt8}, y::AbstractVector{UInt8}) = append!(x, y)
 _append(x::String, y::String) = string(x, y)
 
-# low-level for reading a single frame
+# low-level for reading a single frame (legacy public API; not used by the
+# new receive path but retained for any out-of-tree callers).
 readframe(ws::WebSocket) = readframe(ws.io, Frame, ws.readbuffer)
+
+# --- Fast receive path (used by `receive(ws)`) ---
+
+# Read one frame header from `io`, using `hbuf` (>= WS_MAX_HEADER bytes) as
+# scratch. Returns (flags, payload_len, mask_u32).
+#
+# Reads bytes directly into `hbuf` via `unsafe_read` and parses fields with
+# `unsafe_load`. Avoids the per-call `Ref{T}` heap allocation that the generic
+# `Base.read(io, T)` path uses for primitive types.
+@inline function _read_header(io::IO, hbuf::Vector{UInt8})
+    iocheck(io)
+    GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(2))
+    flags_u16 = GC.@preserve hbuf unsafe_load(Ptr{UInt16}(pointer(hbuf)))
+    flags = FrameFlags(ntoh(flags_u16))
+    if flags.len == 0x7E
+        GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(2))
+        len = UInt64(ntoh(GC.@preserve hbuf unsafe_load(Ptr{UInt16}(pointer(hbuf)))))
+    elseif flags.len == 0x7F
+        GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(8))
+        len = ntoh(GC.@preserve hbuf unsafe_load(Ptr{UInt64}(pointer(hbuf))))
+    else
+        len = UInt64(flags.len)
+    end
+    mask_u32 = UInt32(0)
+    if flags.masked
+        GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(4))
+        mask_u32 = GC.@preserve hbuf unsafe_load(Ptr{UInt32}(pointer(hbuf)))
+    end
+    return flags, len, mask_u32
+end
+
+# Read `n` bytes from `io` directly into `dest[offset+1 : offset+n]`,
+# resizing `dest` if needed.
+@inline function _read_into!(io::IO, dest::Vector{UInt8}, offset::Int, n::Int)
+    n == 0 && return
+    needed = offset + n
+    if length(dest) < needed
+        resize!(dest, needed)
+    end
+    GC.@preserve dest unsafe_read(io, pointer(dest, offset + 1), UInt(n))
+    return
+end
+
+# Read one CONTROL frame (PING/PONG/CLOSE) payload into `dest[1:len]` and
+# return the byte count. `dest` must have capacity >= 125 (RFC 6455 §5.5).
+# Reusing a per-WebSocket scratch buffer here keeps inline control frames
+# alloc-free on the receive hot path.
+function _read_control_payload!(io::IO, dest::Vector{UInt8}, len::UInt64, masked::Bool, mask_u32::UInt32)
+    control_len_check(len)
+    n = Int(len)
+    if n > 0
+        GC.@preserve dest unsafe_read(io, pointer(dest), UInt(n))
+        if masked
+            mask!(dest, mask_u32, 1, n)
+        end
+    end
+    return n
+end
+
+# Read one full data message (possibly fragmented) into ws.readbuffer.
+# Sets ws.message_len to the assembled payload byte length and returns the
+# data opcode (TEXT or BINARY). Handles inline control frames per RFC 6455 §5.4.
+# Throws WebSocketError on protocol violation, CLOSE, or socket error.
+function _recv_message!(ws::WebSocket)
+    @require !ws.readclosed
+    io = ws.io
+    msg_opcode = CONTINUATION
+    offset = 0
+    hbuf = ws.headerbuf
+    while true
+        # @inline at call site keeps the (flags, len, mask_u32) tuple unboxed.
+        flags, len, mask_u32 = @inline _read_header(io, hbuf)
+        if flags.rsv1 || flags.rsv2 || flags.rsv3
+            throw(WebSocketError(CloseFrameBody(1002, "Reserved bits set in frame")))
+        end
+        op = flags.opcode
+        if iscontrol(op)
+            if !flags.final
+                throw(WebSocketError(CloseFrameBody(1002, "Fragmented control frame")))
+            end
+            ctl = ws.ctlbuffer
+            ctl_n = _read_control_payload!(io, ctl, len, flags.masked, mask_u32)
+            if op == CLOSE
+                ws.readclosed = true
+                if ctl_n == 1
+                    throw(WebSocketError(CloseFrameBody(1002, "Close frame cannot have body of length 1")))
+                end
+                status = ctl_n >= 2 ? Int((UInt16(ctl[1]) << 8) | ctl[2]) : 1005
+                if ctl_n >= 2
+                    validclosecheck(status)
+                end
+                # CLOSE body string only allocates here when there's a reason text;
+                # not on the hot path (one CLOSE per connection lifetime).
+                close_msg = if ctl_n > 2
+                    GC.@preserve ctl unsafe_string(pointer(ctl) + 2, ctl_n - 2)
+                else
+                    ""
+                end
+                utf8check(close_msg)
+                body = CloseFrameBody(status, close_msg)
+                if !ws.writeclosed
+                    close(ws, body)
+                end
+                throw(WebSocketError(body))
+            elseif op == PING
+                # Echo the PING body via a view — PONG payload is the same bytes.
+                lock(ws.writelock)
+                try
+                    write_frame!(ws, true, PONG, view(ctl, 1:ctl_n))
+                finally
+                    unlock(ws.writelock)
+                end
+                continue
+            else # PONG
+                continue
+            end
+        end
+        # Data frame
+        if op == CONTINUATION
+            if msg_opcode == CONTINUATION
+                throw(WebSocketError(CloseFrameBody(1002, "Continuation frame cannot be the first frame in a message")))
+            end
+        elseif op == TEXT || op == BINARY
+            if msg_opcode != CONTINUATION
+                throw(WebSocketError(CloseFrameBody(1002, "Received unfragmented frame while still processing fragmented frame")))
+            end
+            msg_opcode = op
+        else
+            throw(WebSocketError(CloseFrameBody(1002, "Unknown opcode in data frame")))
+        end
+        if len > 0
+            n = Int(len)
+            _read_into!(io, ws.readbuffer, offset, n)
+            if flags.masked
+                mask!(ws.readbuffer, mask_u32, offset + 1, n)
+            end
+            offset += n
+        end
+        flags.final && break
+    end
+    ws.message_len = offset
+    return msg_opcode
+end
 
 """
     receive(ws::WebSocket) -> Union{String, Vector{UInt8}}
@@ -847,29 +1006,20 @@ where each iteration yields a message until the connection is closed.
 """
 function receive(ws::WebSocket)
     @debug "$(ws.id): Reading message"
-    @require !ws.readclosed
-    frame = readframe(ws.io, Frame, ws.readbuffer)
-    @debug "$(ws.id): Received frame: $frame"
-    done = checkreadframe!(ws, frame)
-    # common case of reading single non-control frame
-    done && return frame.payload
-    opcode = frame.flags.opcode
-    iscontrol(opcode) && return receive(ws)
-    # if we're here, we're reading a fragmented message
-    payload = frame.payload
-    while true
-        frame = readframe(ws.io, Frame, ws.readbuffer, opcode)
-        @debug "$(ws.id): Received frame: $frame"
-        done = checkreadframe!(ws, frame)
-        if !iscontrol(frame.flags.opcode)
-            payload = _append(payload, frame.payload)
-            @debug "$(ws.id): payload len = $(length(payload))"
+    op = _recv_message!(ws)
+    n = ws.message_len
+    buf = ws.readbuffer
+    if op == TEXT
+        s = GC.@preserve buf unsafe_string(pointer(buf), n)
+        utf8check(s)
+        return s
+    else  # BINARY
+        out = Vector{UInt8}(undef, n)
+        if n > 0
+            GC.@preserve out buf unsafe_copyto!(pointer(out), pointer(buf), n)
         end
-        done && break
+        return out
     end
-    payload isa String && utf8check(payload)
-    @debug "Read message: $(payload[1:min(1024, sizeof(payload))])"
-    return payload
 end
 
 """
