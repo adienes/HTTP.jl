@@ -798,15 +798,12 @@ the close sequence and close the underlying connection.
 function Sockets.send(ws::WebSocket, x)
     @debug "$(ws.id): Writing non-control message"
     @require !ws.writeclosed
-    lock(ws.writelock)
-    try
+    Base.@lock ws.writelock begin
         if isbinary(x) || istext(x)
             payload = _frame_payload(x)
-            if ws.pmd !== nothing
-                n = _send_compressed_frame!(ws, opcode(x), payload)
-            else
-                n = write_frame!(ws, true, opcode(x), payload)
-            end
+            n = ws.pmd === nothing ?
+                write_frame!(ws, true, opcode(x), payload) :
+                _send_compressed_frame!(ws, opcode(x), payload)
             ws.stats.messages_sent += 1
             return n
         end
@@ -832,8 +829,6 @@ function Sockets.send(ws::WebSocket, x)
         end
         ws.stats.messages_sent += 1
         return n
-    finally
-        unlock(ws.writelock)
     end
 end
 
@@ -867,8 +862,7 @@ function send_batch(ws::WebSocket, msgs)
     @require !ws.writeclosed
     nmsgs = length(msgs)
     nmsgs == 0 && return 0
-    lock(ws.writelock)
-    try
+    Base.@lock ws.writelock begin
         masked = ws.client
         # First pass: total buffer size.
         total = 0
@@ -896,8 +890,6 @@ function send_batch(ws::WebSocket, msgs)
         s.messages_sent += nmsgs
         s.bytes_sent += bytes_data
         return n
-    finally
-        unlock(ws.writelock)
     end
 end
 
@@ -912,13 +904,10 @@ to when a PING message is received by a websocket connection.
 function ping(ws::WebSocket, data=UInt8[])
     @require !ws.writeclosed
     @debug "$(ws.id): sending ping"
-    lock(ws.writelock)
-    try
+    Base.@lock ws.writelock begin
         n = write_frame!(ws, true, PING, _frame_payload(data))
         ws.stats.ping_count += 1
         return n
-    finally
-        unlock(ws.writelock)
     end
 end
 
@@ -934,12 +923,7 @@ used as a one-way heartbeat.
 function pong(ws::WebSocket, data=UInt8[])
     @require !ws.writeclosed
     @debug "$(ws.id): sending pong"
-    lock(ws.writelock)
-    try
-        return write_frame!(ws, true, PONG, _frame_payload(data))
-    finally
-        unlock(ws.writelock)
-    end
+    Base.@lock ws.writelock write_frame!(ws, true, PONG, _frame_payload(data))
 end
 
 """
@@ -979,12 +963,7 @@ function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, "")
                                              sizeof(msg))
     end
     try
-        lock(ws.writelock)
-        try
-            write_frame!(ws, true, CLOSE, data)
-        finally
-            unlock(ws.writelock)
-        end
+        Base.@lock ws.writelock write_frame!(ws, true, CLOSE, data)
     catch
         # ignore thrown errors here because we're closing anyway
     end
@@ -1133,12 +1112,7 @@ function _recv_message!(ws::WebSocket)
                 throw(WebSocketError(body))
             elseif op == PING
                 # Echo the PING body via a view — PONG payload is the same bytes.
-                lock(ws.writelock)
-                try
-                    write_frame!(ws, true, PONG, view(ctl, 1:ctl_n))
-                finally
-                    unlock(ws.writelock)
-                end
+                Base.@lock ws.writelock write_frame!(ws, true, PONG, view(ctl, 1:ctl_n))
                 continue
             else # PONG
                 # Track liveness; the heartbeat task reads `stats.last_pong`
