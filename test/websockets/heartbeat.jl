@@ -1,7 +1,7 @@
 # Tests for the optional WebSocket heartbeat (ping_interval / pong_timeout).
 # When set, the client / server fires PINGs at the interval and tears down the
 # connection if no PONG has arrived within pong_timeout. Counts are exposed
-# via `ws.ping_count` / `ws.pong_count` for observability.
+# via `stats(ws).ping_count` / `stats(ws).pong_count` for observability.
 
 using Test
 using HTTP
@@ -41,8 +41,8 @@ using Sockets
                     end
                 end
                 sleep(0.5)
-                @test ws.ping_count >= 3
-                @test ws.pong_count >= 3
+                @test stats(ws).ping_count >= 3
+                @test stats(ws).pong_count >= 3
                 @test !WebSockets.isclosed(ws)
                 # close() will cancel the heartbeat + kill the reader task.
             end

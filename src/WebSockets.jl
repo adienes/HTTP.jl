@@ -8,7 +8,7 @@ using ..Exceptions: current_exceptions_to_string
 import ..open
 import ..HTTP # for doc references
 
-export WebSocket, send, receive, ping, pong
+export WebSocket, send, receive, ping, pong, stats
 
 # 1st 2 bytes of a frame
 primitive type FrameFlags 16 end
@@ -182,7 +182,16 @@ function write_frame!(ws, final::Bool, opcode::OpCode, payload_data::AbstractVec
             mask!(ws.writebuffer, mask_u32, hlen + 1, payloadlen)
         end
     end
-    return emit_frame!(ws, total)
+    n = emit_frame!(ws, total)
+    # Frame-level metrics (includes control frames). `bytes_sent` counts only
+    # data frame payload bytes — that's what HFT operators usually want to
+    # graph; control frame chatter is tracked via ping_count separately.
+    s = ws.stats
+    s.frames_sent += 1
+    if opcode == TEXT || opcode == BINARY || opcode == CONTINUATION
+        s.bytes_sent += payloadlen
+    end
+    return n
 end
 
 # Empty-payload convenience used by control frames.
@@ -229,6 +238,59 @@ ignore the error and return from the `WebSockets.open` or `WebSockets.listen`
 calls without throwing.
 """
 isok(x) = x isa WebSocketError && x.message isa CloseFrameBody && (x.message.status == 1000 || x.message.status == 1001 || x.message.status == 1005)
+
+"""
+    WebSocketStats
+
+Per-connection counters useful for observability and the heartbeat
+mechanism. Fields are mutated from the send / receive / heartbeat paths
+of a single WebSocket and read via [`stats`](@ref). All counters use
+`Int` (process word) and increments are not synchronized — they're
+intended for monitoring, not transactional reads.
+
+Fields:
+
+- `messages_sent::Int`, `messages_received::Int` — fully-assembled
+  application messages (control frames not counted).
+- `frames_sent::Int`, `frames_received::Int` — includes data fragments
+  but excludes control frames.
+- `bytes_sent::Int`, `bytes_received::Int` — payload bytes only
+  (header / mask bytes excluded).
+- `ping_count::Int`, `pong_count::Int` — PINGs we sent / PONGs we
+  observed in the receive path.
+- `last_pong::Float64` — wall-clock time (seconds since epoch) of the
+  most recent PONG; `0.0` if none yet.
+- `last_recv_time::Float64` — wall-clock time of the last *data*
+  message; `0.0` if none yet.
+- `recv_size_buckets::NTuple{6,Int}` — message-size histogram:
+  `(<64, 64–255, 256–1023, 1024–4095, 4096–16383, >=16384)` bytes.
+"""
+mutable struct WebSocketStats
+    messages_sent::Int
+    messages_received::Int
+    frames_sent::Int
+    frames_received::Int
+    bytes_sent::Int
+    bytes_received::Int
+    ping_count::Int
+    pong_count::Int
+    last_pong::Float64
+    last_recv_time::Float64
+    recv_size_buckets::NTuple{6,Int}
+end
+WebSocketStats() = WebSocketStats(0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, (0,0,0,0,0,0))
+
+@inline function _bump_recv_size!(s::WebSocketStats, n::Int)
+    b = s.recv_size_buckets
+    i = n < 64       ? 1 :
+        n < 256      ? 2 :
+        n < 1024     ? 3 :
+        n < 4096     ? 4 :
+        n < 16384    ? 5 :
+                       6
+    s.recv_size_buckets = ntuple(j -> j == i ? b[j] + 1 : b[j], 6)
+    return
+end
 
 """
     WebSocket(io::HTTP.Connection, req, resp; client=true)
@@ -301,18 +363,12 @@ mutable struct WebSocket
     # WebSocket can call send/ping/pong concurrently without corrupting
     # `writebuffer`. Cheap (uncontended) in the single-writer case.
     writelock::ReentrantLock
-    # Wall-clock time (seconds since epoch) of the most recent PONG we
-    # received. Updated from the receive task; read from the heartbeat task.
-    # On 64-bit platforms Float64 stores are atomic, which is sufficient
-    # for a staleness check.
-    last_pong::Float64
     # Background Timer that pings at `ping_interval` and closes the socket
     # if no PONG has arrived within `pong_timeout`. `nothing` when heartbeat
     # is disabled. `close` cancels it.
     heartbeat::Union{Timer,Nothing}
-    # Operational metrics for inspection / heartbeat verification in tests.
-    ping_count::Int
-    pong_count::Int
+    # Operational metrics. See [`WebSocketStats`](@ref) / [`stats`](@ref).
+    stats::WebSocketStats
 end
 
 const DEFAULT_MAX_FRAG = 1024
@@ -332,10 +388,30 @@ function WebSocket(io::Connection, req=Request(), resp=Response();
                      Vector{UInt8}(undef, 125),           # ctlbuffer
                      Vector{UInt8}(undef, WS_MAX_HEADER), # headerbuf
                      0, false, false, rng, ReentrantLock(),
-                     time(),                              # last_pong (priming value)
                      nothing,                             # heartbeat timer
-                     0, 0)                                # ping/pong counts
+                     WebSocketStats())                    # stats
 end
+
+"""
+    stats(ws::WebSocket) -> WebSocketStats
+
+Return the live `WebSocketStats` object for `ws`. The fields are
+updated in place on every send and receive; this returns the struct
+itself (no copy), so the caller can sample it as the connection runs.
+See `WebSocketStats` for the field reference.
+
+```julia
+WebSockets.open(url) do ws
+    @async for _ in ws; end
+    while !WebSockets.isclosed(ws)
+        s = WebSockets.stats(ws)
+        @info "recv" msgs=s.messages_received bytes=s.bytes_received
+        sleep(1)
+    end
+end
+```
+"""
+stats(ws::WebSocket) = ws.stats
 
 """
     WebSockets.isclosed(ws) -> Bool
@@ -392,7 +468,7 @@ end
 function _start_heartbeat!(ws::WebSocket, interval::Union{Nothing,Real}, timeout::Real)
     interval === nothing && return nothing
     # Prime last_pong so the first interval doesn't immediately fire as stale.
-    ws.last_pong = time()
+    ws.stats.last_pong = time()
     iv = Float64(interval)
     to = Float64(timeout)
     t = Timer(iv; interval=iv) do _
@@ -403,7 +479,7 @@ function _start_heartbeat!(ws::WebSocket, interval::Union{Nothing,Real}, timeout
         catch
             return
         end
-        if time() - ws.last_pong > to
+        if time() - ws.stats.last_pong > to
             try
                 isopen(ws.io) && close(ws.io)
             catch
@@ -598,12 +674,16 @@ function Sockets.send(ws::WebSocket, x)
     lock(ws.writelock)
     try
         if isbinary(x) || istext(x)
-            return write_frame!(ws, true, opcode(x), _frame_payload(x))
+            n = write_frame!(ws, true, opcode(x), _frame_payload(x))
+            ws.stats.messages_sent += 1
+            return n
         end
         # Fragmented send: x is an iterable of binary or text fragments.
         state = iterate(x)
         if state === nothing
-            return write_frame!(ws, true, TEXT, UInt8[])
+            n = write_frame!(ws, true, TEXT, UInt8[])
+            ws.stats.messages_sent += 1
+            return n
         end
         @debug "$(ws.id): Writing fragmented message"
         item, st = state
@@ -618,6 +698,7 @@ function Sockets.send(ws::WebSocket, x)
             item, st = nextstate
             nextstate = iterate(x, st)
         end
+        ws.stats.messages_sent += 1
         return n
     finally
         unlock(ws.writelock)
@@ -638,7 +719,7 @@ function ping(ws::WebSocket, data=UInt8[])
     lock(ws.writelock)
     try
         n = write_frame!(ws, true, PING, _frame_payload(data))
-        ws.ping_count += 1
+        ws.stats.ping_count += 1
         return n
     finally
         unlock(ws.writelock)
@@ -848,10 +929,10 @@ function _recv_message!(ws::WebSocket)
                 end
                 continue
             else # PONG
-                # Track liveness; the heartbeat task reads `last_pong` to
-                # detect stale feeds. `pong_count` is exposed for tests/metrics.
-                ws.last_pong = time()
-                ws.pong_count += 1
+                # Track liveness; the heartbeat task reads `stats.last_pong`
+                # to detect stale feeds.
+                ws.stats.last_pong = time()
+                ws.stats.pong_count += 1
                 continue
             end
         end
@@ -876,9 +957,17 @@ function _recv_message!(ws::WebSocket)
             end
             offset += n
         end
+        ws.stats.frames_received += 1
         flags.final && break
     end
     ws.message_len = offset
+    # Roll up message-level stats. Single histogram bump per logical message,
+    # not per frame.
+    s = ws.stats
+    s.messages_received += 1
+    s.bytes_received += offset
+    s.last_recv_time = time()
+    _bump_recv_size!(s, offset)
     return msg_opcode
 end
 
