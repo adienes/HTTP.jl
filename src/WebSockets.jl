@@ -438,6 +438,18 @@ mutable struct WebSocket
     # WebSocket can call send/ping/pong concurrently without corrupting
     # `writebuffer`. Cheap (uncontended) in the single-writer case.
     writelock::ReentrantLock
+    # Wall-clock time (seconds since epoch) of the most recent PONG we
+    # received. Updated from the receive task; read from the heartbeat task.
+    # On 64-bit platforms Float64 stores are atomic, which is sufficient
+    # for a staleness check.
+    last_pong::Float64
+    # Background Timer that pings at `ping_interval` and closes the socket
+    # if no PONG has arrived within `pong_timeout`. `nothing` when heartbeat
+    # is disabled. `close` cancels it.
+    heartbeat::Union{Timer,Nothing}
+    # Operational metrics for inspection / heartbeat verification in tests.
+    ping_count::Int
+    pong_count::Int
 end
 
 const DEFAULT_MAX_FRAG = 1024
@@ -456,7 +468,10 @@ function WebSocket(io::Connection, req=Request(), resp=Response();
                      UInt8[], UInt8[],
                      Vector{UInt8}(undef, 125),           # ctlbuffer
                      Vector{UInt8}(undef, WS_MAX_HEADER), # headerbuf
-                     0, false, false, rng, ReentrantLock())
+                     0, false, false, rng, ReentrantLock(),
+                     time(),                              # last_pong (priming value)
+                     nothing,                             # heartbeat timer
+                     0, 0)                                # ping/pong counts
 end
 
 """
@@ -506,7 +521,44 @@ WebSockets.open(url) do ws
 end
 ```
 """
-function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, kw...)
+
+# Start a heartbeat Timer that sends a PING every `interval` seconds and
+# closes the underlying socket if no PONG has arrived within `timeout`.
+# Returns the Timer (so callers can stash it on `ws.heartbeat` and the
+# socket-close path can stop it). `interval === nothing` means no heartbeat.
+function _start_heartbeat!(ws::WebSocket, interval::Union{Nothing,Real}, timeout::Real)
+    interval === nothing && return nothing
+    # Prime last_pong so the first interval doesn't immediately fire as stale.
+    ws.last_pong = time()
+    iv = Float64(interval)
+    to = Float64(timeout)
+    t = Timer(iv; interval=iv) do _
+        # Drop out if the socket is already gone — the timer will be
+        # closed shortly via the close() path or via finalization.
+        try
+            (ws.writeclosed || ws.readclosed || !isopen(ws.io)) && return
+        catch
+            return
+        end
+        if time() - ws.last_pong > to
+            try
+                isopen(ws.io) && close(ws.io)
+            catch
+            end
+            return
+        end
+        try
+            ping(ws)
+        catch
+            # writeclosed mid-flight, broken pipe, etc. — let the receive
+            # loop see the failure on its next read.
+        end
+    end
+    ws.heartbeat = t
+    return t
+end
+
+function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, kw...)
     key = base64encode(rand(Random.RandomDevice(), UInt8, 16))
     headers = [
         "Upgrade" => "websocket",
@@ -542,6 +594,10 @@ function open(f::Function, url; suppress_close_error::Bool=false, verbose=false,
         end
         ws = WebSocket(io, http.message.request, http.message; maxframesize, maxfragmentation)
         @debug "$(ws.id): WebSocket opened"
+        # Default pong_timeout to 2x the ping interval, the common heuristic
+        # for "the feed is dead" when one side stops responding.
+        _pt = pong_timeout === nothing && ping_interval !== nothing ? 2 * Float64(ping_interval) : pong_timeout
+        _start_heartbeat!(ws, ping_interval, _pt === nothing ? 0.0 : Float64(_pt))
         try
             f(ws)
         catch e
@@ -590,7 +646,7 @@ function listen end
 listen(f, args...; kw...) = Servers.listen(http -> upgrade(f, http; kw...), args...; kw...)
 listen!(f, args...; kw...) = Servers.listen!(http -> upgrade(f, http; kw...), args...; kw...)
 
-function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, kw...)
+function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, kw...)
     @debug "Server websocket upgrade requested"
     isupgrade(http.message) || handshakeerror()
     if !hasheader(http, "Sec-WebSocket-Version", "13")
@@ -620,6 +676,8 @@ function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=f
 
     ws = WebSocket(io, req, req.response; client=false, maxframesize, maxfragmentation)
     @debug "$(ws.id): WebSocket upgraded; connection established"
+    _pt = pong_timeout === nothing && ping_interval !== nothing ? 2 * Float64(ping_interval) : pong_timeout
+    _start_heartbeat!(ws, ping_interval, _pt === nothing ? 0.0 : Float64(_pt))
     try
         f(ws)
     catch e
@@ -730,7 +788,9 @@ function ping(ws::WebSocket, data=UInt8[])
     @debug "$(ws.id): sending ping"
     lock(ws.writelock)
     try
-        return write_frame!(ws, true, PING, _frame_payload(data))
+        n = write_frame!(ws, true, PING, _frame_payload(data))
+        ws.ping_count += 1
+        return n
     finally
         unlock(ws.writelock)
     end
@@ -769,6 +829,12 @@ frame.
 function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, ""))
     isclosed(ws) && return
     @debug "$(ws.id): Closing websocket"
+    # Stop the heartbeat timer (if any) so it doesn't keep firing pings into
+    # a half-closed socket.
+    if ws.heartbeat !== nothing
+        try; close(ws.heartbeat::Timer); catch; end
+        ws.heartbeat = nothing
+    end
     ws.writeclosed = true
     msg = body.message
     payload_len = 2 + sizeof(msg)
@@ -970,6 +1036,10 @@ function _recv_message!(ws::WebSocket)
                 end
                 continue
             else # PONG
+                # Track liveness; the heartbeat task reads `last_pong` to
+                # detect stale feeds. `pong_count` is exposed for tests/metrics.
+                ws.last_pong = time()
+                ws.pong_count += 1
                 continue
             end
         end
