@@ -1000,8 +1000,43 @@ function _recv_message!(ws::WebSocket)
     return msg_opcode
 end
 
+# Run `body()` with a wall-clock deadline. If `timeout` seconds elapse before
+# `body` returns, the underlying TCP socket is closed so the blocking read
+# unblocks and `_recv_message!` throws a WebSocketError(1006). This is the
+# correct semantics for HFT stale-feed detection: a feed that has gone silent
+# is presumed dead, and the application should reconnect rather than try to
+# keep waiting on a half-open socket.
+#
+# `timeout::Nothing` means no deadline; `body()` is called directly.
+@inline function _with_recv_deadline(body, ws::WebSocket, timeout)
+    timeout === nothing && return body()
+    timed_out = Ref(false)
+    t = Timer(Float64(timeout)) do _
+        timed_out[] = true
+        try
+            isopen(ws.io) && close(ws.io)
+        catch
+        end
+    end
+    try
+        return body()
+    catch e
+        # If our timer fired, the underlying socket close surfaces as an
+        # EOFError/IOError from inside unsafe_read. Translate it to the
+        # protocol-level abnormal-closure error so callers can rely on a
+        # single typed exception for stale-feed detection.
+        if timed_out[]
+            throw(WebSocketError(CloseFrameBody(1006, "Receive timed out after $(timeout)s")))
+        end
+        rethrow()
+    finally
+        close(t)
+    end
+end
+
 """
     receive(ws::WebSocket) -> Union{String, Vector{UInt8}}
+    receive(ws::WebSocket; timeout::Real) -> Union{String, Vector{UInt8}}
 
 Receive a message from a websocket connection. Returns a `String` if
 the message was TEXT, or a `Vector{UInt8}` if the message was BINARY.
@@ -1015,22 +1050,30 @@ frames will continue to be read until the final fragment is received.
 The bodies of each fragment are concatenated into the final message
 returned by `receive`. Note that `WebSocket` objects can be iterated,
 where each iteration yields a message until the connection is closed.
+
+If `timeout` (in seconds) is passed and no message arrives within that
+window, the underlying TCP socket is closed and a `WebSocketError`
+with status 1006 ("abnormal closure") is thrown. This is the
+appropriate semantic for HFT-style stale-feed detection: a silent
+feed is presumed dead and should trigger a reconnect.
 """
-function receive(ws::WebSocket)
+function receive(ws::WebSocket; timeout::Union{Nothing,Real}=nothing)
     @debug "$(ws.id): Reading message"
-    op = _recv_message!(ws)
-    n = ws.message_len
-    buf = ws.readbuffer
-    if op == TEXT
-        s = GC.@preserve buf unsafe_string(pointer(buf), n)
-        utf8check(s)
-        return s
-    else  # BINARY
-        out = Vector{UInt8}(undef, n)
-        if n > 0
-            GC.@preserve out buf unsafe_copyto!(pointer(out), pointer(buf), n)
+    return _with_recv_deadline(ws, timeout) do
+        op = _recv_message!(ws)
+        n = ws.message_len
+        buf = ws.readbuffer
+        if op == TEXT
+            s = GC.@preserve buf unsafe_string(pointer(buf), n)
+            utf8check(s)
+            return s
+        else  # BINARY
+            out = Vector{UInt8}(undef, n)
+            if n > 0
+                GC.@preserve out buf unsafe_copyto!(pointer(out), pointer(buf), n)
+            end
+            return out
         end
-        return out
     end
 end
 
@@ -1068,19 +1111,22 @@ WebSockets.open(url) do ws
 end
 ```
 """
-function receive(f::Function, ws::WebSocket; validate_utf8::Bool=false)
+function receive(f::Function, ws::WebSocket; validate_utf8::Bool=false,
+                 timeout::Union{Nothing,Real}=nothing)
     @debug "$(ws.id): Reading message (zero-copy)"
-    op = _recv_message!(ws)
-    n = ws.message_len
-    buf = ws.readbuffer
-    v = view(buf, 1:n)
-    if validate_utf8 && op == TEXT
-        # `isvalid(::AbstractString)` does UTF-8 validation. We materialize
-        # the bytes into a String once for the check; this still skips the
-        # owned-payload alloc that `receive(ws)` makes for the return value.
-        isvalid(String(copy(v))) || throw(WebSocketError(CloseFrameBody(1007, "Invalid UTF-8")))
+    return _with_recv_deadline(ws, timeout) do
+        op = _recv_message!(ws)
+        n = ws.message_len
+        buf = ws.readbuffer
+        v = view(buf, 1:n)
+        if validate_utf8 && op == TEXT
+            # `isvalid(::AbstractString)` does UTF-8 validation. We materialize
+            # the bytes into a String once for the check; this still skips the
+            # owned-payload alloc that `receive(ws)` makes for the return value.
+            isvalid(String(copy(v))) || throw(WebSocketError(CloseFrameBody(1007, "Invalid UTF-8")))
+        end
+        return f(v, op)
     end
-    return f(v, op)
 end
 
 """
