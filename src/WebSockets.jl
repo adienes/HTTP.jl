@@ -923,41 +923,53 @@ and the connection is closed. If a CLOSE frame hasn't already been received, the
 CLOSE frame is sent and `receive` is attempted to receive the responding CLOSE
 frame.
 """
+# Build the CLOSE frame payload: 2-byte network-order status + UTF-8 reason.
+function _close_body_bytes(body::CloseFrameBody)
+    msg = body.message
+    data = Vector{UInt8}(undef, 2 + sizeof(msg))
+    GC.@preserve data msg begin
+        p = pointer(data)
+        unsafe_store!(Ptr{UInt16}(p), hton(UInt16(body.status)))
+        if sizeof(msg) > 0
+            unsafe_copyto!(p + 2, convert(Ptr{UInt8}, pointer(msg)), sizeof(msg))
+        end
+    end
+    return data
+end
+
+# Cancel and release resources we own besides the socket. Called once from
+# `close`, before the CLOSE frame is sent.
+function _release_resources!(ws::WebSocket)
+    if ws.heartbeat !== nothing
+        try; close(ws.heartbeat); catch; end
+        ws.heartbeat = nothing
+    end
+    if ws.pmd !== nothing
+        # The finalizer would catch this eventually; freeing now keeps the
+        # libz state count predictable in long-running processes.
+        _pmd_close!(ws.pmd)
+        ws.pmd = nothing
+    end
+    return
+end
+
 function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, ""))
     isclosed(ws) && return
     @debug "$(ws.id): Closing websocket"
-    # Stop the heartbeat timer (if any) so it doesn't keep firing pings into
-    # a half-closed socket.
-    if ws.heartbeat !== nothing
-        try; close(ws.heartbeat::Timer); catch; end
-        ws.heartbeat = nothing
-    end
-    # Release zlib resources promptly (the finalizer will also do this,
-    # but eagerly freeing keeps the libz state count predictable).
-    if ws.pmd !== nothing
-        _pmd_close!(ws.pmd::PMDContext)
-        ws.pmd = nothing
-    end
+    _release_resources!(ws)
     ws.writeclosed = true
-    msg = body.message
-    payload_len = 2 + sizeof(msg)
-    data = Vector{UInt8}(undef, payload_len)
-    st = hton(UInt16(body.status))
-    GC.@preserve data unsafe_store!(Ptr{UInt16}(pointer(data, 1)), st)
-    if sizeof(msg) > 0
-        GC.@preserve data msg unsafe_copyto!(pointer(data, 3),
-                                             convert(Ptr{UInt8}, pointer(msg)),
-                                             sizeof(msg))
-    end
+    # Send our CLOSE frame. If the peer has already gone away the write may
+    # fail; the close path proceeds regardless.
     try
-        Base.@lock ws.writelock write_frame!(ws, true, CLOSE, data)
+        Base.@lock ws.writelock write_frame!(ws, true, CLOSE, _close_body_bytes(body))
     catch
-        # ignore thrown errors here because we're closing anyway
     end
-    # if we're initiating the close, wait until we receive the
-    # responding close frame or timeout
+    # If we initiated the close, drive a bounded receive loop so the peer's
+    # CLOSE arrives and `_recv_message!` sets readclosed. The timer is the
+    # backstop: 5 s with no peer CLOSE => declare the half-close lost and
+    # tear down.
     if !ws.readclosed
-        Timer(5) do t
+        Timer(5) do _
             ws.readclosed = true
             !ws.client && isopen(ws.io) && close(ws.io)
         end
@@ -966,15 +978,13 @@ function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, "")
         try
             receive(ws)
         catch
-            # ignore thrown errors here because we're closing anyway
-            # but set readclosed so we don't keep trying to read
+            # Read error during shutdown; treat as "peer's CLOSE will never
+            # come" so we stop looping.
             ws.readclosed = true
         end
     end
-    # we either recieved the responding CLOSE frame and readclosed was set
-    # or there was an error/timeout reading it; in any case, readclosed should be closed now
     @assert ws.readclosed
-    # if we're the server, it's our job to close the underlying socket
+    # Server is responsible for tearing down the underlying socket.
     !ws.client && isopen(ws.io) && close(ws.io)
     return
 end
@@ -994,24 +1004,26 @@ end
 # `Base.read(io, T)` path uses for primitive types.
 @inline function _read_header(io::IO, hbuf::Vector{UInt8})
     iocheck(io)
-    GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(2))
-    flags_u16 = GC.@preserve hbuf unsafe_load(Ptr{UInt16}(pointer(hbuf)))
-    flags = FrameFlags(ntoh(flags_u16))
-    if flags.len == 0x7E
-        GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(2))
-        len = UInt64(ntoh(GC.@preserve hbuf unsafe_load(Ptr{UInt16}(pointer(hbuf)))))
-    elseif flags.len == 0x7F
-        GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(8))
-        len = ntoh(GC.@preserve hbuf unsafe_load(Ptr{UInt64}(pointer(hbuf))))
-    else
-        len = UInt64(flags.len)
+    GC.@preserve hbuf begin
+        p = pointer(hbuf)
+        unsafe_read(io, p, UInt(2))
+        flags = FrameFlags(ntoh(unsafe_load(Ptr{UInt16}(p))))
+        if flags.len == 0x7E
+            unsafe_read(io, p, UInt(2))
+            len = UInt64(ntoh(unsafe_load(Ptr{UInt16}(p))))
+        elseif flags.len == 0x7F
+            unsafe_read(io, p, UInt(8))
+            len = ntoh(unsafe_load(Ptr{UInt64}(p)))
+        else
+            len = UInt64(flags.len)
+        end
+        mask_u32 = UInt32(0)
+        if flags.masked
+            unsafe_read(io, p, UInt(4))
+            mask_u32 = unsafe_load(Ptr{UInt32}(p))
+        end
+        return flags, len, mask_u32
     end
-    mask_u32 = UInt32(0)
-    if flags.masked
-        GC.@preserve hbuf unsafe_read(io, pointer(hbuf), UInt(4))
-        mask_u32 = GC.@preserve hbuf unsafe_load(Ptr{UInt32}(pointer(hbuf)))
-    end
-    return flags, len, mask_u32
 end
 
 # Read `n` bytes from `io` directly into `dest[offset+1 : offset+n]`,
