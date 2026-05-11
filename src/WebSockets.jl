@@ -4,6 +4,7 @@ using Base64, UUIDs, Sockets, Random
 using Random: Xoshiro
 using MbedTLS: digest, MD_SHA1, SSLContext
 using ..IOExtras, ..Streams, ..Connections, ..Messages, ..Conditions, ..Servers
+import ..PerMessageDeflate as PMD
 using ..Exceptions: current_exceptions_to_string
 import ..open
 import ..HTTP # for doc references
@@ -148,15 +149,17 @@ end
 end
 
 # Encode one frame into `buf[offset+1 : new_offset]` and return `new_offset`.
-# Does NOT touch the socket. Shared by `write_frame!` (single frame) and
-# `send_batch` (N frames coalesced into one write).
+# Does NOT touch the socket. Shared by `write_frame!` (single frame),
+# `send_batch` (N frames coalesced), and the permessage-deflate send path
+# (which sets `rsv1=true` to signal compression).
 @inline function _encode_frame!(ws, buf::Vector{UInt8}, offset::Int, final::Bool,
-                                opcode::OpCode, payload_data::AbstractVector{UInt8})
+                                opcode::OpCode, payload_data::AbstractVector{UInt8};
+                                rsv1::Bool=false)
     payloadlen = length(payload_data)
     masked = ws.client
     hlen = header_len_for(payloadlen, masked)
     mask_u32 = masked ? ws_mask(ws) : UInt32(0)
-    write_header!(buf, final, opcode, masked, payloadlen, mask_u32; at=offset)
+    write_header!(buf, final, opcode, masked, payloadlen, mask_u32; at=offset, rsv1=rsv1)
     if payloadlen > 0
         copyto!(buf, offset + hlen + 1, payload_data, firstindex(payload_data), payloadlen)
         if masked
@@ -202,6 +205,7 @@ function write_frame!(ws, final::Bool, opcode::OpCode, payload_data::AbstractVec
     s.frames_sent += 1
     if opcode == TEXT || opcode == BINARY || opcode == CONTINUATION
         s.bytes_sent += payloadlen
+        s.compressed_bytes_sent += payloadlen  # no compression in this path
     end
     return n
 end
@@ -284,13 +288,52 @@ mutable struct WebSocketStats
     frames_received::Int
     bytes_sent::Int
     bytes_received::Int
+    # On a permessage-deflate connection these track the wire-bytes (post-
+    # compress on send, pre-decompress on recv) so operators can compute the
+    # compression ratio as `compressed_bytes_sent / bytes_sent`. Equal to
+    # bytes_sent / bytes_received when the extension is not negotiated.
+    compressed_bytes_sent::Int
+    compressed_bytes_received::Int
     ping_count::Int
     pong_count::Int
     last_pong::Float64
     last_recv_time::Float64
     recv_size_buckets::NTuple{6,Int}
 end
-WebSocketStats() = WebSocketStats(0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, (0,0,0,0,0,0))
+WebSocketStats() = WebSocketStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0, (0,0,0,0,0,0))
+
+"""
+    PMDContext
+
+Per-WebSocket permessage-deflate state. Holds the deflate / inflate
+contexts and reusable scratch buffers for compressed payloads. Created
+on handshake when `permessage_deflate=true` is negotiated, finalised
+in `close(ws)`.
+"""
+mutable struct PMDContext
+    deflate::PMD.ZStream
+    inflate::PMD.ZStream
+    # Output buffer for compressed payload (send path). Grown to high-water mark.
+    deflate_out::Vector{UInt8}
+    # Output buffer for decompressed payload (receive path).
+    inflate_out::Vector{UInt8}
+    # finalize() must be called exactly once.
+    closed::Bool
+end
+function PMDContext()
+    d = PMD.ZStream(); PMD.deflate_init!(d)
+    i = PMD.ZStream(); PMD.inflate_init!(i)
+    ctx = PMDContext(d, i, UInt8[], UInt8[], false)
+    finalizer(_pmd_close!, ctx)
+    return ctx
+end
+function _pmd_close!(ctx::PMDContext)
+    ctx.closed && return
+    ctx.closed = true
+    try; PMD.deflate_end!(ctx.deflate); catch; end
+    try; PMD.inflate_end!(ctx.inflate); catch; end
+    return
+end
 
 @inline function _bump_recv_size!(s::WebSocketStats, n::Int)
     b = s.recv_size_buckets
@@ -381,6 +424,14 @@ mutable struct WebSocket
     heartbeat::Union{Timer,Nothing}
     # Operational metrics. See [`WebSocketStats`](@ref) / [`stats`](@ref).
     stats::WebSocketStats
+    # RFC 7692 permessage-deflate context; `nothing` when the extension was
+    # not negotiated. Created during handshake by `open` / `upgrade`.
+    pmd::Union{PMDContext,Nothing}
+    # Auxiliary buffer used by the receive path when a compressed message is
+    # spread across multiple frames. Compressed bytes accumulate here; once
+    # the FIN frame arrives we inflate into `pmd.inflate_out` and copy back
+    # into `readbuffer` so receive() sees a uniform layout.
+    compressed_buffer::Vector{UInt8}
 end
 
 const DEFAULT_MAX_FRAG = 1024
@@ -401,7 +452,9 @@ function WebSocket(io::Connection, req=Request(), resp=Response();
                      Vector{UInt8}(undef, WS_MAX_HEADER), # headerbuf
                      0, false, false, rng, ReentrantLock(),
                      nothing,                             # heartbeat timer
-                     WebSocketStats())                    # stats
+                     WebSocketStats(),                    # stats
+                     nothing,                             # pmd (set by handshake)
+                     UInt8[])                             # compressed_buffer
 end
 
 """
@@ -451,6 +504,19 @@ function hashedkey(key)
     hashkey = "$(strip(key))258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     return base64encode(digest(MD_SHA1, hashkey))
 end
+
+# Returns true if `msg`'s Sec-WebSocket-Extensions header indicates the
+# server accepted permessage-deflate (with any parameters). We don't
+# validate the specific parameters since we implement no_context_takeover
+# for both directions regardless of negotiation outcome — sub-optimal but
+# always wire-compatible.
+function _server_accepted_pmd(msg)
+    h = header(msg, "Sec-WebSocket-Extensions", "")
+    return occursin("permessage-deflate", lowercase(h))
+end
+
+# Returns true if the client offered permessage-deflate.
+_client_offers_pmd(http) = _server_accepted_pmd(http.message)
 
 """
     WebSockets.open(handler, url; verbose=false, kw...)
@@ -509,7 +575,7 @@ function _start_heartbeat!(ws::WebSocket, interval::Union{Nothing,Real}, timeout
     return t
 end
 
-function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, kw...)
+function open(f::Function, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=false, kw...)
     key = base64encode(rand(Random.RandomDevice(), UInt8, 16))
     headers = [
         "Upgrade" => "websocket",
@@ -518,6 +584,13 @@ function open(f::Function, url; suppress_close_error::Bool=false, verbose=false,
         "Sec-WebSocket-Version" => "13",
         headers...
     ]
+    if permessage_deflate
+        # Offer the simplest interoperable form: bare permessage-deflate
+        # plus no_context_takeover on both sides. RFC 7692 servers are
+        # required to honor or refuse; if refused, we run uncompressed.
+        push!(headers, "Sec-WebSocket-Extensions" =>
+              "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+    end
     # HTTP.open
     open("GET", url, headers; verbose=verbose, kw...) do http
         startread(http)
@@ -544,7 +617,12 @@ function open(f::Function, url; suppress_close_error::Bool=false, verbose=false,
             end
         end
         ws = WebSocket(io, http.message.request, http.message; maxframesize, maxfragmentation)
-        @debug "$(ws.id): WebSocket opened"
+        # If the server accepted permessage-deflate, attach the compression
+        # context. Otherwise leave `pmd === nothing` (no compression).
+        if permessage_deflate && _server_accepted_pmd(http.message)
+            ws.pmd = PMDContext()
+        end
+        @debug "$(ws.id): WebSocket opened (pmd=$(ws.pmd !== nothing))"
         # Default pong_timeout to 2x the ping interval, the common heuristic
         # for "the feed is dead" when one side stops responding.
         _pt = pong_timeout === nothing && ping_interval !== nothing ? 2 * Float64(ping_interval) : pong_timeout
@@ -597,7 +675,7 @@ function listen end
 listen(f, args...; kw...) = Servers.listen(http -> upgrade(f, http; kw...), args...; kw...)
 listen!(f, args...; kw...) = Servers.listen!(http -> upgrade(f, http; kw...), args...; kw...)
 
-function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, kw...)
+function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=true, kw...)
     @debug "Server websocket upgrade requested"
     isupgrade(http.message) || handshakeerror()
     if !hasheader(http, "Sec-WebSocket-Version", "13")
@@ -611,6 +689,14 @@ function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=f
     setheader(http, "Connection" => "Upgrade")
     key = header(http, "Sec-WebSocket-Key")
     setheader(http, "Sec-WebSocket-Accept" => hashedkey(key))
+    # If the client offered permessage-deflate (and the server allows it),
+    # advertise acceptance with no_context_takeover on both sides — the
+    # mode our implementation supports.
+    pmd_accepted = permessage_deflate && _client_offers_pmd(http)
+    if pmd_accepted
+        setheader(http, "Sec-WebSocket-Extensions" =>
+                  "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+    end
     startwrite(http)
     io = http.stream
     req = http.message
@@ -626,7 +712,10 @@ function upgrade(f::Function, http::Streams.Stream; suppress_close_error::Bool=f
     end
 
     ws = WebSocket(io, req, req.response; client=false, maxframesize, maxfragmentation)
-    @debug "$(ws.id): WebSocket upgraded; connection established"
+    if pmd_accepted
+        ws.pmd = PMDContext()
+    end
+    @debug "$(ws.id): WebSocket upgraded; connection established (pmd=$(ws.pmd !== nothing))"
     _pt = pong_timeout === nothing && ping_interval !== nothing ? 2 * Float64(ping_interval) : pong_timeout
     _start_heartbeat!(ws, ping_interval, _pt === nothing ? 0.0 : Float64(_pt))
     try
@@ -667,6 +756,32 @@ opcode(x) = isbinary(x) ? BINARY : TEXT
 @inline _frame_payload(x::AbstractString) = codeunits(x)
 @inline _frame_payload(x) = codeunits(string(x))
 
+# Send one fully-compressed message in a single frame, with RSV1 set.
+# RFC 7692 §7.2.1: compress the message with Z_SYNC_FLUSH and strip the
+# trailing 0x00 0x00 0xff 0xff. The compressed bytes go in `ws.pmd.deflate_out`,
+# which is reused across sends.
+function _send_compressed_frame!(ws::WebSocket, op::OpCode, payload::AbstractVector{UInt8})
+    pmd = ws.pmd::PMDContext
+    plen = length(payload)
+    nbytes = PMD.compress_message!(pmd.deflate, payload, plen, pmd.deflate_out)
+    masked = ws.client
+    total = header_len_for(nbytes, masked) + nbytes
+    if length(ws.writebuffer) < total
+        resize!(ws.writebuffer, total)
+    end
+    # Read compressed bytes from pmd.deflate_out into the WebSocket writebuffer
+    # via _encode_frame!. Because `payload_data` is an AbstractVector{UInt8},
+    # we pass a view over pmd.deflate_out.
+    _encode_frame!(ws, ws.writebuffer, 0, true, op,
+                   view(pmd.deflate_out, 1:nbytes); rsv1=true)
+    n = emit_frame!(ws, total)
+    s = ws.stats
+    s.frames_sent += 1
+    s.bytes_sent += plen          # uncompressed payload (app-level metric)
+    s.compressed_bytes_sent += nbytes  # post-deflate wire bytes (ratio numerator)
+    return n
+end
+
 """
     send(ws::WebSocket, msg)
 
@@ -686,7 +801,12 @@ function Sockets.send(ws::WebSocket, x)
     lock(ws.writelock)
     try
         if isbinary(x) || istext(x)
-            n = write_frame!(ws, true, opcode(x), _frame_payload(x))
+            payload = _frame_payload(x)
+            if ws.pmd !== nothing
+                n = _send_compressed_frame!(ws, opcode(x), payload)
+            else
+                n = write_frame!(ws, true, opcode(x), payload)
+            end
             ws.stats.messages_sent += 1
             return n
         end
@@ -841,6 +961,12 @@ function Base.close(ws::WebSocket, body::CloseFrameBody=CloseFrameBody(1000, "")
         try; close(ws.heartbeat::Timer); catch; end
         ws.heartbeat = nothing
     end
+    # Release zlib resources promptly (the finalizer will also do this,
+    # but eagerly freeing keeps the libz state count predictable).
+    if ws.pmd !== nothing
+        _pmd_close!(ws.pmd::PMDContext)
+        ws.pmd = nothing
+    end
     ws.writeclosed = true
     msg = body.message
     payload_len = 2 + sizeof(msg)
@@ -960,11 +1086,21 @@ function _recv_message!(ws::WebSocket)
     msg_opcode = CONTINUATION
     offset = 0
     hbuf = ws.headerbuf
+    # `msg_compressed` is set when the first data frame of the message had
+    # RSV1=1 (RFC 7692 §6: only the first frame of a message carries the
+    # compression flag).
+    msg_compressed = false
     while true
         # @inline at call site keeps the (flags, len, mask_u32) tuple unboxed.
         flags, len, mask_u32 = @inline _read_header(io, hbuf)
-        if flags.rsv1 || flags.rsv2 || flags.rsv3
+        # RSV1 is permitted only on the first frame of a compressed message
+        # when permessage-deflate was negotiated. RSV2/RSV3 are never valid
+        # without further extensions.
+        if flags.rsv2 || flags.rsv3
             throw(WebSocketError(CloseFrameBody(1002, "Reserved bits set in frame")))
+        end
+        if flags.rsv1 && (ws.pmd === nothing || iscontrol(flags.opcode))
+            throw(WebSocketError(CloseFrameBody(1002, "RSV1 set without permessage-deflate")))
         end
         op = flags.opcode
         if iscontrol(op)
@@ -1017,28 +1153,59 @@ function _recv_message!(ws::WebSocket)
             if msg_opcode == CONTINUATION
                 throw(WebSocketError(CloseFrameBody(1002, "Continuation frame cannot be the first frame in a message")))
             end
+            # Continuation frames inherit the message's compression flag;
+            # they must not carry RSV1 themselves.
+            if flags.rsv1
+                throw(WebSocketError(CloseFrameBody(1002, "RSV1 set on continuation frame")))
+            end
         elseif op == TEXT || op == BINARY
             if msg_opcode != CONTINUATION
                 throw(WebSocketError(CloseFrameBody(1002, "Received unfragmented frame while still processing fragmented frame")))
             end
             msg_opcode = op
+            msg_compressed = flags.rsv1  # capture from first data frame
         else
             throw(WebSocketError(CloseFrameBody(1002, "Unknown opcode in data frame")))
         end
         if len > 0
             n = Int(len)
-            _read_into!(io, ws.readbuffer, offset, n)
+            # Compressed messages accumulate into a separate buffer so the
+            # uncompressed `readbuffer` can be the destination of the inflate
+            # output (no aliasing).
+            target = msg_compressed ? ws.compressed_buffer : ws.readbuffer
+            _read_into!(io, target, offset, n)
             if flags.masked
-                mask!(ws.readbuffer, mask_u32, offset + 1, n)
+                mask!(target, mask_u32, offset + 1, n)
             end
             offset += n
         end
         ws.stats.frames_received += 1
         flags.final && break
     end
+    # If the message was compressed, decompress now into readbuffer. The
+    # final `offset` here is the count of compressed bytes; we update it
+    # to the inflated byte count for downstream consumption.
+    if msg_compressed
+        pmd = ws.pmd::PMDContext
+        ws.stats.compressed_bytes_received += offset
+        offset = PMD.decompress_message!(pmd.inflate, ws.compressed_buffer, offset, pmd.inflate_out)
+        # Copy decompressed bytes into readbuffer so downstream paths see the
+        # same buffer regardless of whether compression was used.
+        if length(ws.readbuffer) < offset
+            resize!(ws.readbuffer, offset)
+        end
+        if offset > 0
+            GC.@preserve ws unsafe_copyto!(pointer(ws.readbuffer),
+                                            pointer(pmd.inflate_out), offset)
+        end
+    else
+        # Uncompressed: wire bytes == app bytes.
+        ws.stats.compressed_bytes_received += offset
+    end
     ws.message_len = offset
     # Roll up message-level stats. Single histogram bump per logical message,
-    # not per frame.
+    # not per frame. `bytes_received` reflects the application's view of the
+    # message (post-decompression), matching `bytes_sent` semantics.
     s = ws.stats
     s.messages_received += 1
     s.bytes_received += offset
