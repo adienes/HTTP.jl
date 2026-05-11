@@ -26,15 +26,13 @@ println()
 
 # ---- mask! ----
 println("## mask! (XOR a byte buffer with a 32-bit key)")
-# Use the Mask wrapper for both branches: on master that hits the legacy byte-by-byte
-# loop, on hft-optim it goes through the new chunked path via the backward-compat overload.
-# (The 2-arg mask!(bytes, mask) signature on master has an untyped 2nd arg, so
-# `hasmethod(... Tuple{Vector{UInt8}, UInt32})` matches there too but the loop body
-# fails on UInt32, which is why we avoid that path-detect.)
+# `mask!` accepts either a `UInt32` key directly (current API) or a `Mask`
+# wrapper (older API, removed in the cleanup commit). Use whichever the
+# branch exposes so the bench runs unmodified across the whole history.
+const _MASK_ARG = isdefined(WS, :Mask) ? WS.Mask(rand(UInt32)) : rand(UInt32)
 for n in (32, 256, 1024, 16384, 1_048_576)
     buf = rand(UInt8, n)
-    msk = WS.Mask(rand(UInt32))
-    b = @benchmark WS.mask!($buf, $msk) samples=1000 evals=10
+    b = @benchmark WS.mask!($buf, $(_MASK_ARG)) samples=1000 evals=10
     t_ns = minimum(b).time
     gbps = (n / (t_ns * 1e-9)) / 1e9
     @printf "  %10d bytes: %8.1f ns  (%.2f GB/s)\n" n t_ns gbps
@@ -78,26 +76,28 @@ if isdefined(WS, :write_frame!)
     end
 end
 
-# ---- Frame()+writeframe path (legacy, still on both branches) ----
-println()
-println("## Frame(...)+writeframe(io, frame) -> IOBuffer  (legacy path)")
+# ---- Frame()+writeframe path (only on commits before the cleanup) ----
+if isdefined(WS, :Frame) && isdefined(WS, :writeframe)
+    println()
+    println("## Frame(...)+writeframe(io, frame) -> IOBuffer  (legacy path)")
 
-struct StreamShim <: IO
-    io::IOBuffer
-end
-Base.unsafe_write(s::StreamShim, p::Ptr{UInt8}, n::UInt) = unsafe_write(s.io, p, n)
-Base.write(s::StreamShim, x::AbstractVector{UInt8}) = write(s.io, x)
-Base.isopen(::StreamShim) = true
-
-for client in (true, false), n in (32, 128, 1024, 16384)
-    msg_orig = rand(UInt8, n)
-    s = StreamShim(IOBuffer())
-    bench = function ()
-        truncate(s.io, 0); seekstart(s.io)
-        msg = copy(msg_orig)  # writeframe mutates payload when client
-        WS.writeframe(s, WS.Frame(true, WS.BINARY, client, msg))
+    struct StreamShim <: IO
+        io::IOBuffer
     end
-    b = @benchmark $bench() samples=2000 evals=5
-    t = minimum(b)
-    @printf "  client=%-5s len=%-6d  %7.1f ns  alloc=%d (%d bytes)\n" client n t.time t.allocs t.memory
+    Base.unsafe_write(s::StreamShim, p::Ptr{UInt8}, n::UInt) = unsafe_write(s.io, p, n)
+    Base.write(s::StreamShim, x::AbstractVector{UInt8}) = write(s.io, x)
+    Base.isopen(::StreamShim) = true
+
+    for client in (true, false), n in (32, 128, 1024, 16384)
+        msg_orig = rand(UInt8, n)
+        s = StreamShim(IOBuffer())
+        bench = function ()
+            truncate(s.io, 0); seekstart(s.io)
+            msg = copy(msg_orig)  # writeframe mutates payload when client
+            WS.writeframe(s, WS.Frame(true, WS.BINARY, client, msg))
+        end
+        b = @benchmark $bench() samples=2000 evals=5
+        t = minimum(b)
+        @printf "  client=%-5s len=%-6d  %7.1f ns  alloc=%d (%d bytes)\n" client n t.time t.allocs t.memory
+    end
 end
