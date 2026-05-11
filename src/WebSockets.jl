@@ -1023,6 +1023,55 @@ function receive(ws::WebSocket)
 end
 
 """
+    receive(f, ws::WebSocket; validate_utf8=false)
+
+Zero-copy variant of [`receive`](@ref): reads one full (possibly
+fragmented) non-control message into the WebSocket's internal buffer
+and calls `f(payload, opcode)`, where `payload` is a transient
+`SubArray{UInt8}` view of the bytes (valid only until the next
+`receive` / `send` call on `ws`) and `opcode` is `WebSockets.TEXT` or
+`WebSockets.BINARY`.
+
+This avoids the per-message allocation that `receive(ws)` does to
+materialize the returned `String` or `Vector{UInt8}`. If the caller
+needs to retain the bytes beyond the call, they must `copy(payload)`
+or `String(copy(payload))`.
+
+UTF-8 validation is **not** performed by default. Pass
+`validate_utf8=true` to opt in for TEXT messages. The default-off
+behavior is intended for HFT pipelines where the upstream payload is
+known to be well-formed (and where a one-shot UTF-8 scan over every
+message would dominate hot-path cost).
+
+Whatever `f` returns is returned from `receive`.
+
+```julia
+WebSockets.open(url) do ws
+    while !WebSockets.isclosed(ws)
+        receive(ws) do bytes, op
+            # parse `bytes` directly (e.g. via simdjson / msgpack / your
+            # own protocol) - no allocation occurs here from HTTP.jl's side.
+        end
+    end
+end
+```
+"""
+function receive(f::Function, ws::WebSocket; validate_utf8::Bool=false)
+    @debug "$(ws.id): Reading message (zero-copy)"
+    op = _recv_message!(ws)
+    n = ws.message_len
+    buf = ws.readbuffer
+    v = view(buf, 1:n)
+    if validate_utf8 && op == TEXT
+        # `isvalid(::AbstractString)` does UTF-8 validation. We materialize
+        # the bytes into a String once for the check; this still skips the
+        # owned-payload alloc that `receive(ws)` makes for the return value.
+        isvalid(String(copy(v))) || throw(WebSocketError(CloseFrameBody(1007, "Invalid UTF-8")))
+    end
+    return f(v, op)
+end
+
+"""
     iterate(ws)
 
 Continuously call `receive(ws)` on a `WebSocket` connection, with
