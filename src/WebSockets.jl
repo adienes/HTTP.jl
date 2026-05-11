@@ -176,12 +176,80 @@ end
 # the WebSocket struct without forward-declaration gymnastics.
 @inline ws_mask(ws) = rand(ws.rng, UInt32)
 
-# Low-level: emit one fully-prepared frame from `ws.writebuffer[1:total_len]`
-# in a single `unsafe_write`. Caller must hold `ws.writelock`.
+# libuv uv_buf_t layout (POSIX): { char *base; size_t len; }
+struct _UvBuf
+    base::Ptr{UInt8}
+    len::Csize_t
+end
+
+# Best-effort synchronous write via libuv's `uv_try_write`. Returns the
+# number of bytes written (>= 0) or a negative UV error code (UV_EAGAIN
+# being the expected "kernel buffer full, retry" signal).
+#
+# Skips Julia's normal `unsafe_write(::LibuvStream, ...)` path entirely,
+# which would:
+#   1. `Libc.malloc` a uv_write_t request struct (not GC-tracked, but a libc cost),
+#   2. submit the write to the libuv event loop,
+#   3. `current_task() / preserve_handle / sigatomic_begin / wait()` to suspend,
+#   4. resume on the libuv write callback,
+#   5. box the Cint status value through the task's Any-typed `.result`.
+#
+# Steps (3)–(5) account for the per-send `Ptr{UInt8}` / `Int64` / `UInt64`
+# heap allocations Profile.Allocs attributes to `Connections.unsafe_write`.
+# When the kernel send buffer has space (the common case on a steady-state
+# hot connection) `uv_try_write` completes in one syscall with no Julia-side
+# allocation at all.
+#
+# Safety: libuv requires that calls into a stream be serialized via the
+# event-loop's lock. Julia exposes that as `Base.iolock_{begin,end}` —
+# we acquire it the same way `Base.unsafe_write` does.
+@inline function _uv_try_write(sock::Sockets.TCPSocket, p::Ptr{UInt8}, n::UInt)
+    n == 0 && return 0
+    handle = sock.handle
+    handle == C_NULL && return -1
+    buf = Ref(_UvBuf(p, Csize_t(n)))
+    Base.iolock_begin()
+    r = try
+        GC.@preserve buf ccall(:uv_try_write, Cint,
+            (Ptr{Cvoid}, Ptr{Cvoid}, Cuint),
+            handle, Base.unsafe_convert(Ptr{Cvoid}, buf), Cuint(1))
+    finally
+        Base.iolock_end()
+    end
+    return Int(r)
+end
+
+# Low-level: emit one fully-prepared frame from `ws.writebuffer[1:total_len]`.
+# Caller must hold `ws.writelock`.
+#
+# Fast path (plain TCP, no TLS, kernel buffer has space): one `uv_try_write`
+# ccall — no malloc, no task suspend, no callback. This is what we hit in
+# steady-state HFT use.
+#
+# Fallback (TLS, partial write, EAGAIN, or any error): the standard
+# `unsafe_write(ws.io, ...)` for the remaining bytes. The fallback's
+# blocking semantics mean a slow consumer applies natural backpressure —
+# the writelock holds, the caller blocks until libuv drains.
 @inline function emit_frame!(ws, total_len::Int)
     buf = ws.writebuffer
-    n = GC.@preserve buf unsafe_write(ws.io, pointer(buf), UInt(total_len))
-    return Int(n)
+    sock = ws.io.io
+    written = 0
+    if sock isa Sockets.TCPSocket
+        r = GC.@preserve buf _uv_try_write(sock, pointer(buf), UInt(total_len))
+        if r == total_len
+            return total_len
+        end
+        if r > 0
+            written = r
+        end
+        # r < 0: error (most often UV_EAGAIN). Fall through to the regular
+        # async-write path which will block-and-callback until drained.
+    end
+    if written < total_len
+        n = GC.@preserve buf unsafe_write(ws.io, pointer(buf) + written, UInt(total_len - written))
+        written += Int(n)
+    end
+    return written
 end
 
 # Encode one frame and write it out via the WebSocket's preallocated buffer.
