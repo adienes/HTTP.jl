@@ -29,7 +29,8 @@ println()
 # Pick a port range above 30000 to reduce collisions.
 const PORT_BASE = 33000
 
-function bench_oneway_blast(payload::Vector{UInt8}, N::Int; port::Int)
+function bench_oneway_blast(payload::Vector{UInt8}, N::Int; port::Int,
+                            batch_size::Int=1)
     received_count = Threads.Atomic{Int}(0)
     server_done = Channel{Nothing}(1)
     srv = WS.listen!("127.0.0.1", port; suppress_close_error=true) do ws
@@ -58,13 +59,24 @@ function bench_oneway_blast(payload::Vector{UInt8}, N::Int; port::Int)
     t = 0.0
     allocd = 0
     gc_count = 0
+    use_batch = batch_size > 1 && isdefined(WS, :send_batch)
     WS.open("ws://127.0.0.1:$port") do ws
+        batch = fill(payload, batch_size)  # all entries are the same Vector ref
         # warm
-        for _ in 1:1000; send(ws, payload); end
+        if use_batch
+            for _ in 1:cld(1000, batch_size); WS.send_batch(ws, batch); end
+        else
+            for _ in 1:1000; send(ws, payload); end
+        end
         GC.gc()
         n0 = Base.gc_num()
         t0 = time()
-        for _ in 1:N; send(ws, payload); end
+        if use_batch
+            nbatches = cld(N, batch_size)
+            for _ in 1:nbatches; WS.send_batch(ws, batch); end
+        else
+            for _ in 1:N; send(ws, payload); end
+        end
         t = time() - t0
         n1 = Base.gc_num()
         allocd = (n1.poolalloc + n1.bigalloc) - (n0.poolalloc + n0.bigalloc)
@@ -73,7 +85,8 @@ function bench_oneway_blast(payload::Vector{UInt8}, N::Int; port::Int)
     # wait for server to drain
     try; take!(server_done); catch; end
     close(srv)
-    return (t=t, allocs_per_msg=allocd / N, msgs_per_sec=N / t)
+    sent = use_batch ? cld(N, batch_size) * batch_size : N
+    return (t=t, allocs_per_msg=allocd / sent, msgs_per_sec=sent / t)
 end
 
 function bench_pingpong(payload::Vector{UInt8}, N::Int; port::Int)
@@ -173,6 +186,18 @@ for sz in SIZES
     payload = rand(UInt8, sz)
     r = bench_oneway_blast(payload, 50_000; port=PORT_BASE + size_offset(sz))
     @printf "  payload=%-6d  %7.1f k msg/s  %5.2f allocs/send  (%.2f s)\n" sz (r.msgs_per_sec/1000) r.allocs_per_msg r.t
+end
+
+if isdefined(WS, :send_batch)
+    println()
+    println("## one-way blast (client -> server) via send_batch, N=50_000")
+    for sz in SIZES, b in (8, 64)
+        payload = rand(UInt8, sz)
+        r = bench_oneway_blast(payload, 50_000;
+                                port=PORT_BASE + 400 + 10*size_offset(sz) + b,
+                                batch_size=b)
+        @printf "  payload=%-6d batch=%-4d  %7.1f k msg/s  %5.2f allocs/send  (%.2f s)\n" sz b (r.msgs_per_sec/1000) r.allocs_per_msg r.t
+    end
 end
 
 println()

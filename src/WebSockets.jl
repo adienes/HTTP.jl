@@ -8,7 +8,7 @@ using ..Exceptions: current_exceptions_to_string
 import ..open
 import ..HTTP # for doc references
 
-export WebSocket, send, receive, ping, pong, stats
+export WebSocket, send, send_batch, receive, ping, pong, stats
 
 # 1st 2 bytes of a frame
 primitive type FrameFlags 16 end
@@ -106,11 +106,13 @@ const WS_MAX_HEADER = 14
     return base + (masked ? 4 : 0)
 end
 
-# Build the websocket frame header into `buf[1 : header_len_for(...)]`.
-# Caller (write_frame!) guarantees the buffer is large enough.
-# Layout follows RFC 6455 §5.2.
+# Build the websocket frame header into `buf[at+1 : at+header_len_for(...)]`.
+# Caller guarantees the buffer is large enough. Layout follows RFC 6455 §5.2.
+# `at=0` (default) writes at the start of the buffer; non-zero `at` lets
+# `send_batch` write multiple frames back-to-back into a single buffer.
 @inline function write_header!(buf::Vector{UInt8}, final::Bool, opcode::OpCode,
-                               masked::Bool, payloadlen::Integer, mask_u32::UInt32,
+                               masked::Bool, payloadlen::Integer, mask_u32::UInt32;
+                               at::Int=0,
                                rsv1::Bool=false, rsv2::Bool=false, rsv3::Bool=false)
     b1 = (final ? 0x80 : 0x00) |
          (rsv1 ? 0x40 : 0x00) | (rsv2 ? 0x20 : 0x00) | (rsv3 ? 0x10 : 0x00) |
@@ -123,9 +125,9 @@ end
         len7 = 0x7F; extb = 8
     end
     b2 = (masked ? 0x80 : 0x00) | len7
-    @inbounds buf[1] = b1
-    @inbounds buf[2] = b2
-    pos = 3
+    @inbounds buf[at + 1] = b1
+    @inbounds buf[at + 2] = b2
+    pos = at + 3
     GC.@preserve buf begin
         if extb == 2
             unsafe_store!(Ptr{UInt16}(pointer(buf, pos)), hton(UInt16(payloadlen)))
@@ -135,15 +137,33 @@ end
             pos += 8
         end
         if masked
-            # Stored in host byte order to match the existing wire convention
-            # used by readframe (`Mask(read(io, UInt32))`); on little-endian
-            # this places the low byte of `mask_u32` first on the wire, which
-            # matches mask!'s key[i] = (mask_u32 >> 8*(i mod 4)) & 0xFF.
+            # Stored in host byte order to match wire convention on little-endian:
+            # the low byte of `mask_u32` ends up first on the wire, matching
+            # mask!'s key[i] = (mask_u32 >> 8*(i mod 4)) & 0xFF.
             unsafe_store!(Ptr{UInt32}(pointer(buf, pos)), mask_u32)
             pos += 4
         end
     end
-    return pos - 1
+    return pos - 1 - at
+end
+
+# Encode one frame into `buf[offset+1 : new_offset]` and return `new_offset`.
+# Does NOT touch the socket. Shared by `write_frame!` (single frame) and
+# `send_batch` (N frames coalesced into one write).
+@inline function _encode_frame!(ws, buf::Vector{UInt8}, offset::Int, final::Bool,
+                                opcode::OpCode, payload_data::AbstractVector{UInt8})
+    payloadlen = length(payload_data)
+    masked = ws.client
+    hlen = header_len_for(payloadlen, masked)
+    mask_u32 = masked ? ws_mask(ws) : UInt32(0)
+    write_header!(buf, final, opcode, masked, payloadlen, mask_u32; at=offset)
+    if payloadlen > 0
+        copyto!(buf, offset + hlen + 1, payload_data, firstindex(payload_data), payloadlen)
+        if masked
+            mask!(buf, mask_u32, offset + hlen + 1, payloadlen)
+        end
+    end
+    return offset + hlen + payloadlen
 end
 
 # Generate a 32-bit masking key from the WebSocket's per-connection RNG.
@@ -169,19 +189,11 @@ end
 function write_frame!(ws, final::Bool, opcode::OpCode, payload_data::AbstractVector{UInt8})
     payloadlen = length(payload_data)
     masked = ws.client
-    hlen = header_len_for(payloadlen, masked)
-    total = hlen + payloadlen
+    total = header_len_for(payloadlen, masked) + payloadlen
     if length(ws.writebuffer) < total
         resize!(ws.writebuffer, total)
     end
-    mask_u32 = masked ? ws_mask(ws) : UInt32(0)
-    write_header!(ws.writebuffer, final, opcode, masked, payloadlen, mask_u32)
-    if payloadlen > 0
-        copyto!(ws.writebuffer, hlen + 1, payload_data, firstindex(payload_data), payloadlen)
-        if masked
-            mask!(ws.writebuffer, mask_u32, hlen + 1, payloadlen)
-        end
-    end
+    _encode_frame!(ws, ws.writebuffer, 0, final, opcode, payload_data)
     n = emit_frame!(ws, total)
     # Frame-level metrics (includes control frames). `bytes_sent` counts only
     # data frame payload bytes — that's what HFT operators usually want to
@@ -699,6 +711,70 @@ function Sockets.send(ws::WebSocket, x)
             nextstate = iterate(x, st)
         end
         ws.stats.messages_sent += 1
+        return n
+    finally
+        unlock(ws.writelock)
+    end
+end
+
+"""
+    send_batch(ws::WebSocket, msgs)
+
+Send N separate websocket messages with **one** `unsafe_write` to the
+underlying socket. `msgs` is any iterable of `AbstractString` (sent as
+TEXT) and/or `AbstractVector{UInt8}` (sent as BINARY); each element
+becomes its own FIN=1 frame, *not* one fragmented message.
+
+Encodes all frames back-to-back into the WebSocket's preallocated
+writebuffer, then issues a single write. With Nagle disabled (the
+default for `WebSockets.open` / `upgrade`) this guarantees the entire
+batch lands in one TCP segment when small enough — eliminating the
+per-frame syscall and scheduler-roundtrip overhead that caps the
+single-`send` loopback path at ~40k msg/s.
+
+```julia
+# Publish 100 small order updates with 1 syscall instead of 100:
+send_batch(ws, [JSON.write(order) for order in orders])
+```
+
+Throws if any element isn't an AbstractString / AbstractVector{UInt8}.
+Maintains the same multi-writer safety as `send` (writelock).
+
+Returns the number of bytes written (header + payload, summed across
+the batch).
+"""
+function send_batch(ws::WebSocket, msgs)
+    @require !ws.writeclosed
+    nmsgs = length(msgs)
+    nmsgs == 0 && return 0
+    lock(ws.writelock)
+    try
+        masked = ws.client
+        # First pass: total buffer size.
+        total = 0
+        @inbounds for m in msgs
+            mlen = m isa AbstractString ? sizeof(m) :
+                   m isa AbstractVector{UInt8} ? length(m) :
+                   throw(ArgumentError("send_batch entries must be AbstractString or AbstractVector{UInt8}"))
+            total += header_len_for(mlen, masked) + mlen
+        end
+        if length(ws.writebuffer) < total
+            resize!(ws.writebuffer, total)
+        end
+        # Second pass: encode each frame back-to-back.
+        offset = 0
+        bytes_data = 0
+        for m in msgs
+            pload = _frame_payload(m)
+            op = isbinary(m) ? BINARY : TEXT
+            offset = _encode_frame!(ws, ws.writebuffer, offset, true, op, pload)
+            bytes_data += length(pload)
+        end
+        n = emit_frame!(ws, total)
+        s = ws.stats
+        s.frames_sent += nmsgs
+        s.messages_sent += nmsgs
+        s.bytes_sent += bytes_data
         return n
     finally
         unlock(ws.writelock)
