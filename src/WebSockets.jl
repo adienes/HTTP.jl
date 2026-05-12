@@ -498,6 +498,13 @@ mutable struct WebSocket
     # the FIN frame arrives we inflate into `pmd.inflate_out` and copy back
     # into `readbuffer` so receive() sees a uniform layout.
     const compressed_buffer::Vector{UInt8}
+    # Busy-poll budget on receive, in nanoseconds. When > 0 and the
+    # underlying transport is a plain TCP socket, the receive path spins on
+    # `recv(MSG_DONTWAIT)` for up to this many nanoseconds before falling
+    # back to libuv's blocking read. Trades CPU for tail-latency wins.
+    # See `_read_n_bytes!` for the details. Set via the `busy_poll_us`
+    # kwarg on `WebSockets.open` / `WebSockets.upgrade` / the constructor.
+    const busy_poll_ns::UInt32
 end
 
 const DEFAULT_MAX_FRAG = 1024
@@ -507,7 +514,8 @@ IOExtras.tcpsocket(ws::WebSocket) = tcpsocket(ws.io)
 function WebSocket(io::Connection, req=Request(), resp=Response();
                    client::Bool=true,
                    maxframesize::Integer=typemax(Int),
-                   maxfragmentation::Integer=DEFAULT_MAX_FRAG)
+                   maxfragmentation::Integer=DEFAULT_MAX_FRAG,
+                   busy_poll_us::Integer=0)
     rng = Xoshiro(rand(Random.RandomDevice(), UInt64),
                   rand(Random.RandomDevice(), UInt64),
                   rand(Random.RandomDevice(), UInt64),
@@ -520,7 +528,8 @@ function WebSocket(io::Connection, req=Request(), resp=Response();
                      nothing,                             # heartbeat timer
                      WebSocketStats(),                    # stats
                      nothing,                             # pmd (set by handshake)
-                     UInt8[])                             # compressed_buffer
+                     UInt8[],                             # compressed_buffer
+                     UInt32(busy_poll_us * 1000))         # busy_poll_ns
 end
 
 """
@@ -651,7 +660,7 @@ function _start_heartbeat!(ws::WebSocket, interval::Union{Nothing,Real}, timeout
     return t
 end
 
-function open(f::F, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=false, kw...) where {F}
+function open(f::F, url; suppress_close_error::Bool=false, verbose=false, headers=[], maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle::Bool=false, quickack::Bool=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=false, busy_poll_us::Integer=0, kw...) where {F}
     key = base64encode(rand(Random.RandomDevice(), UInt8, 16))
     headers = [
         "Upgrade" => "websocket",
@@ -690,7 +699,8 @@ function open(f::F, url; suppress_close_error::Bool=false, verbose=false, header
                 try Sockets.quickack(sock, quickack) catch end
             end
         end
-        ws = WebSocket(io, http.message.request, http.message; maxframesize, maxfragmentation)
+        ws = WebSocket(io, http.message.request, http.message;
+                       maxframesize, maxfragmentation, busy_poll_us)
         # If the server accepted permessage-deflate, attach the compression
         # context. Otherwise leave `pmd === nothing` (no compression).
         if permessage_deflate && _pmd_in_extensions(http.message)
@@ -751,7 +761,7 @@ listen(f::F, args...; kw...) where {F} =
 listen!(f::F, args...; kw...) where {F} =
     Servers.listen!(http -> upgrade(f, http; kw...), args...; kw...)
 
-function upgrade(f::F, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=true, kw...) where {F}
+function upgrade(f::F, http::Streams.Stream; suppress_close_error::Bool=false, maxframesize::Integer=typemax(Int), maxfragmentation::Integer=DEFAULT_MAX_FRAG, nagle=false, quickack=true, ping_interval::Union{Nothing,Real}=nothing, pong_timeout::Union{Nothing,Real}=nothing, permessage_deflate::Bool=true, busy_poll_us::Integer=0, kw...) where {F}
     @debug "Server websocket upgrade requested"
     isupgrade(http.message) || handshakeerror()
     if !hasheader(http, "Sec-WebSocket-Version", "13")
@@ -786,7 +796,8 @@ function upgrade(f::F, http::Streams.Stream; suppress_close_error::Bool=false, m
         end
     end
 
-    ws = WebSocket(io, req, req.response; client=false, maxframesize, maxfragmentation)
+    ws = WebSocket(io, req, req.response;
+                   client=false, maxframesize, maxfragmentation, busy_poll_us)
     if pmd_accepted
         ws.pmd = PMDContext()
     end
@@ -1070,50 +1081,114 @@ end
 @noinline control_len_check(len) = len > 125 && throw(WebSocketError(CloseFrameBody(1002, "Invalid length for control frame")))
 @noinline utf8check(x) = isvalid(x) || throw(WebSocketError(CloseFrameBody(1007, "Invalid UTF-8")))
 
+# --- Busy-poll receive (kernel-bypass) ---
+#
+# When `ws.busy_poll_ns > 0` and the underlying transport is a plain
+# `TCPSocket` (not TLS), `_read_n_bytes!` spins on `recv(fd, ..., MSG_DONTWAIT)`
+# directly against the kernel for up to `busy_poll_ns` nanoseconds before
+# falling back to libuv's blocking `unsafe_read`. The point is to skip the
+# task suspend/wake cycle that the libuv read path takes on every receive —
+# the same idea as our send-side `uv_try_write`, but for reads (libuv has
+# no `uv_try_read`). Trades CPU for latency; intended for HFT receive loops
+# where the application has a dedicated thread for the WebSocket.
+#
+# Race note: while the spin runs, our task does not yield, so libuv's read
+# callbacks don't fire. The kernel buffer accumulates incoming bytes for our
+# `recv` to drain. On fallback, libuv catches up via the normal path. The
+# two never read from the kernel concurrently.
+
+const _MSG_DONTWAIT = @static Sys.isapple() ? Cint(0x80) : Cint(0x40)
+# EAGAIN: macOS 35, Linux 11. EWOULDBLOCK aliases on both.
+const _EAGAIN_ERRNO = @static Sys.isapple() ? Cint(35) : Cint(11)
+
+@inline _ws_fd(s::Sockets.TCPSocket) = reinterpret(Cint, Base.fd(s))
+
+# Read exactly `n` bytes into `p[1:n]`. Throws on closed/error. When
+# `busy_poll_ns > 0` and `sock` is a plain TCP socket, spin on
+# non-blocking recv first; for whatever doesn't arrive within the budget,
+# fall back to `unsafe_read(ws.io, ...)`.
+@inline function _read_n_bytes!(ws::WebSocket, p::Ptr{UInt8}, n::UInt)
+    n == 0 && return
+    sock = ws.io.io
+    busy_ns = ws.busy_poll_ns
+    have = UInt(0)
+    if busy_ns != 0 && sock isa Sockets.TCPSocket
+        fd = _ws_fd(sock)
+        t0 = time_ns()
+        while have < n
+            r = ccall(:recv, Cssize_t, (Cint, Ptr{Cvoid}, Csize_t, Cint),
+                      fd, p + have, n - have, _MSG_DONTWAIT)
+            if r > 0
+                have += UInt(r)
+                continue
+            elseif r == 0
+                # Peer half-closed mid-frame.
+                throw(WebSocketError(CloseFrameBody(1006, "Peer closed during recv")))
+            end
+            errno = Libc.errno()
+            if errno == _EAGAIN_ERRNO
+                # Nothing yet — check budget, otherwise keep spinning.
+                time_ns() - t0 >= busy_ns && break
+                continue
+            end
+            if errno == 4  # EINTR
+                continue
+            end
+            throw(WebSocketError(CloseFrameBody(1006, "recv failed (errno $errno)")))
+        end
+    end
+    # Fallback: libuv-driven blocking read for whatever the spin didn't get.
+    if have < n
+        iocheck(ws.io)
+        unsafe_read(ws.io, p + have, n - have)
+    end
+    return
+end
+
 # --- Fast receive path (used by `receive(ws)`) ---
 
-# Read one frame header from `io`, using `hbuf` (>= WS_MAX_HEADER bytes) as
-# scratch. Returns (flags, payload_len, mask_u32).
+# Read one frame header into `hbuf` (>= WS_MAX_HEADER bytes) and parse it.
+# Returns (flags, payload_len, mask_u32).
 #
-# Reads bytes directly into `hbuf` via `unsafe_read` and parses fields with
-# `unsafe_load`. Avoids the per-call `Ref{T}` heap allocation that the generic
-# `Base.read(io, T)` path uses for primitive types. Inlining is forced at the
-# `_recv_message!` call site (via `@inline _read_header(...)`) — that's what
-# matters for keeping the returned tuple unboxed; no need to mark the
-# definition.
-function _read_header(io::IO, hbuf::Vector{UInt8})
-    iocheck(io)
+# Reads bytes through `_read_n_bytes!`, which routes through `recv(MSG_DONTWAIT)`
+# + busy-poll when enabled, falling back to libuv otherwise. Parses fields
+# via `unsafe_load`, avoiding the per-call `Ref{T}` allocation that the
+# generic `Base.read(io, T)` path uses for primitive types.
+#
+# Inlining is forced at the `_recv_message!` call site (via
+# `@inline _read_header(...)`) — that's what keeps the returned tuple
+# unboxed; no need to mark the definition.
+function _read_header(ws::WebSocket, hbuf::Vector{UInt8})
     GC.@preserve hbuf begin
         p = pointer(hbuf)
-        unsafe_read(io, p, UInt(2))
+        _read_n_bytes!(ws, p, UInt(2))
         flags = FrameFlags(ntoh(unsafe_load(Ptr{UInt16}(p))))
         if flags.len == 0x7E
-            unsafe_read(io, p, UInt(2))
+            _read_n_bytes!(ws, p, UInt(2))
             len = UInt64(ntoh(unsafe_load(Ptr{UInt16}(p))))
         elseif flags.len == 0x7F
-            unsafe_read(io, p, UInt(8))
+            _read_n_bytes!(ws, p, UInt(8))
             len = ntoh(unsafe_load(Ptr{UInt64}(p)))
         else
             len = UInt64(flags.len)
         end
         mask_u32 = UInt32(0)
         if flags.masked
-            unsafe_read(io, p, UInt(4))
+            _read_n_bytes!(ws, p, UInt(4))
             mask_u32 = unsafe_load(Ptr{UInt32}(p))
         end
         return flags, len, mask_u32
     end
 end
 
-# Read `n` bytes from `io` directly into `dest[offset+1 : offset+n]`,
-# resizing `dest` if needed.
-@inline function _read_into!(io::IO, dest::Vector{UInt8}, offset::Int, n::Int)
+# Read `n` bytes into `dest[offset+1 : offset+n]`, resizing `dest` if needed.
+@inline function _read_into!(ws::WebSocket, dest::Vector{UInt8}, offset::Int, n::Int)
     n == 0 && return
     needed = offset + n
     if length(dest) < needed
         resize!(dest, needed)
     end
-    GC.@preserve dest unsafe_read(io, pointer(dest, offset + 1), UInt(n))
+    GC.@preserve dest _read_n_bytes!(ws, pointer(dest, offset + 1), UInt(n))
     return
 end
 
@@ -1121,11 +1196,11 @@ end
 # return the byte count. `dest` must have capacity >= 125 (RFC 6455 §5.5).
 # Reusing a per-WebSocket scratch buffer here keeps inline control frames
 # alloc-free on the receive hot path.
-function _read_control_payload!(io::IO, dest::Vector{UInt8}, len::UInt64, masked::Bool, mask_u32::UInt32)
+function _read_control_payload!(ws::WebSocket, dest::Vector{UInt8}, len::UInt64, masked::Bool, mask_u32::UInt32)
     control_len_check(len)
     n = Int(len)
     if n > 0
-        GC.@preserve dest unsafe_read(io, pointer(dest), UInt(n))
+        GC.@preserve dest _read_n_bytes!(ws, pointer(dest), UInt(n))
         if masked
             mask!(dest, mask_u32, 1, n)
         end
@@ -1139,7 +1214,6 @@ end
 # Throws WebSocketError on protocol violation, CLOSE, or socket error.
 function _recv_message!(ws::WebSocket)
     @require !ws.readclosed
-    io = ws.io
     msg_opcode = CONTINUATION
     offset = 0
     hbuf = ws.headerbuf
@@ -1149,7 +1223,7 @@ function _recv_message!(ws::WebSocket)
     msg_compressed = false
     while true
         # @inline at call site keeps the (flags, len, mask_u32) tuple unboxed.
-        flags, len, mask_u32 = @inline _read_header(io, hbuf)
+        flags, len, mask_u32 = @inline _read_header(ws, hbuf)
         # RSV1 is permitted only on the first frame of a compressed message
         # when permessage-deflate was negotiated. RSV2/RSV3 are never valid
         # without further extensions.
@@ -1165,7 +1239,7 @@ function _recv_message!(ws::WebSocket)
                 throw(WebSocketError(CloseFrameBody(1002, "Fragmented control frame")))
             end
             ctl = ws.ctlbuffer
-            ctl_n = _read_control_payload!(io, ctl, len, flags.masked, mask_u32)
+            ctl_n = _read_control_payload!(ws, ctl, len, flags.masked, mask_u32)
             if op == CLOSE
                 ws.readclosed = true
                 if ctl_n == 1
@@ -1227,7 +1301,7 @@ function _recv_message!(ws::WebSocket)
             # uncompressed `readbuffer` can be the destination of the inflate
             # output (no aliasing).
             target = msg_compressed ? ws.compressed_buffer : ws.readbuffer
-            _read_into!(io, target, offset, n)
+            _read_into!(ws, target, offset, n)
             if flags.masked
                 mask!(target, mask_u32, offset + 1, n)
             end
