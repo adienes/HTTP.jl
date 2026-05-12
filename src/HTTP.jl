@@ -81,6 +81,7 @@ include("download.jl")
 include("Servers.jl")                  ;using .Servers; using .Servers: listen
 include("Handlers.jl")                 ;using .Handlers; using .Handlers: serve
 include("parsemultipart.jl")           ;using .MultiPartParsing: parse_multipart_form
+include("PerMessageDeflate.jl")
 include("WebSockets.jl")               ;using .WebSockets
 
 const nobody = UInt8[]
